@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect } from "react";
-import mammoth from "mammoth";
 import { Upload, BookOpen, FileText, Trash2, CheckCircle,
          AlertCircle, XCircle, Loader, Copy, Settings, X, ArrowLeft,
-         Download, AlertTriangle, ShieldCheck, ExternalLink } from "lucide-react";
+         Download, AlertTriangle, ShieldCheck, ExternalLink, ChevronDown, ChevronUp } from "lucide-react";
+import { extractPdfText, extractDocxText } from "./lib/extractText.js";
+import { chunkReferenceIntoSentences, extractClaims } from "./lib/textProcessing.js";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -36,53 +37,104 @@ const CONFIDENCE = {
 };
 
 // ── Providers ─────────────────────────────────────────────────────────────────
-// "kind" picks the request/response shape. Everything except Anthropic speaks
-// the OpenAI-compatible chat/completions format (OpenAI itself, Google's and
-// Hugging Face's OpenAI-compat routers, Groq, OpenRouter, and any local
-// server — Ollama, LM Studio, vLLM) — only base URL & default model differ.
+// Ordered by how they're presented in Settings: recommended local-only path
+// first, then self-hosted local AI, then bring-your-own-key providers (kept
+// separate, tucked behind a toggle, since that's a meaningfully bigger ask
+// than clicking one button). "kind" picks the request/response shape —
+// everything except Anthropic speaks the OpenAI-compatible chat/completions
+// format, only base URL & default model differ.
 const PROVIDER_DEFAULTS = {
-  anthropic:   { label: 'Anthropic (Claude)', kind: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', model: 'claude-sonnet-5', keyRequired: true,  supportsPdf: true  },
-  openai:      { label: 'OpenAI',             kind: 'openai',    baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o', keyRequired: true, supportsPdf: false },
-  google:      { label: 'Google (Gemini)',    kind: 'openai',    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', keyRequired: true, supportsPdf: false },
-  groq:        { label: 'Groq',               kind: 'openai',    baseUrl: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile', keyRequired: true, supportsPdf: false },
-  openrouter:  { label: 'OpenRouter',         kind: 'openai',    baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o', keyRequired: true, supportsPdf: false },
-  huggingface: { label: 'Hugging Face',       kind: 'openai',    baseUrl: 'https://router.huggingface.co/v1', model: 'meta-llama/Llama-3.3-70B-Instruct', keyRequired: true, supportsPdf: false },
-  local:       { label: 'Local / custom (OpenAI-compatible)', kind: 'openai', baseUrl: 'http://localhost:11434/v1', model: '', keyRequired: false, supportsPdf: false },
+  browser:     { label: 'Local — no API key, no setup', kind: 'browser', baseUrl: '', model: '', keyRequired: false, supportsPdf: true, tier: 'recommended' },
+  local:       { label: 'Local AI (Ollama, LM Studio…)', kind: 'openai', baseUrl: 'http://localhost:11434/v1', model: '', keyRequired: false, supportsPdf: true, tier: 'local' },
+  anthropic:   { label: 'Anthropic (Claude)', kind: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', model: 'claude-sonnet-5', keyRequired: true,  supportsPdf: true, tier: 'api', aliases: ['claude', 'anthropic', 'sonnet', 'opus'] },
+  openai:      { label: 'OpenAI',             kind: 'openai',    baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o', keyRequired: true, supportsPdf: true, tier: 'api', aliases: ['openai', 'gpt', 'chatgpt'] },
+  google:      { label: 'Google (Gemini)',    kind: 'openai',    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', keyRequired: true, supportsPdf: true, tier: 'api', aliases: ['google', 'gemini'] },
+  groq:        { label: 'Groq',               kind: 'openai',    baseUrl: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile', keyRequired: true, supportsPdf: true, tier: 'api', aliases: ['groq'] },
+  openrouter:  { label: 'OpenRouter',         kind: 'openai',    baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o', keyRequired: true, supportsPdf: true, tier: 'api', aliases: ['openrouter', 'router'] },
+  huggingface: { label: 'Hugging Face',       kind: 'openai',    baseUrl: 'https://router.huggingface.co/v1', model: 'meta-llama/Llama-3.3-70B-Instruct', keyRequired: true, supportsPdf: true, tier: 'api', aliases: ['huggingface', 'hugging face', 'hf'] },
+  deepseek:    { label: 'DeepSeek',           kind: 'openai',    baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', keyRequired: true, supportsPdf: true, tier: 'api', aliases: ['deepseek'] },
+  custom:      { label: 'Custom API',         kind: 'openai',    baseUrl: '', model: '', keyRequired: true, supportsPdf: true, tier: 'api', aliases: [] },
 };
+const API_KEY_PROVIDERS = Object.entries(PROVIDER_DEFAULTS).filter(([, d]) => d.tier === 'api' && d !== PROVIDER_DEFAULTS.custom).map(([k]) => k);
+
+// Typed provider name -> best-matching known providers, for the "type a
+// name, we recognize it and fill the rest in" box. Deliberately forgiving
+// (prefix match either direction, or substring) since a typo shouldn't
+// dump someone into "fill in everything yourself" when we could have helped.
+function matchApiProviders(input) {
+  const q = input.trim().toLowerCase();
+  if (!q) return [];
+  return API_KEY_PROVIDERS
+    .map(key => ({ key, ...PROVIDER_DEFAULTS[key] }))
+    .filter(d => d.aliases.some(a => a.startsWith(q) || q.startsWith(a) || a.includes(q)))
+    .slice(0, 4);
+}
+
+// `quality` is a real measured number — accuracy against a small hand-built
+// test set (bench-testset.mjs / bench-run.mjs in the repo, reproducible),
+// not an estimate. 6 retrieval cases and 14 reasoning cases is a small
+// sample, not a rigorous benchmark, but it's real signal instead of a guess.
+// bge-small-en-v1.5 was dropped: it scored 83% on our test, worse than both
+// options below, while also being larger than MiniLM — no axis it wins on.
+const EMBED_MODELS = [
+  { id: 'Xenova/all-MiniLM-L6-v2',  label: 'all-MiniLM-L6-v2',  size: '~80MB',  quality: 100, desc: 'Default — 100% on our retrieval test (6 cases), smallest and fastest of the tied options' },
+  { id: 'Xenova/bge-base-en-v1.5',  label: 'bge-base-en-v1.5',  size: '~210MB', quality: 100, desc: 'Also 100% on our test — larger, built specifically for retrieval; worth trying if MiniLM misses something on your paper' },
+];
+const NLI_MODELS = [
+  { id: 'Xenova/nli-deberta-v3-base', label: 'nli-deberta-v3-base', size: '~350MB', quality: 79, desc: 'Default — 79% on our reasoning test (14 cases), reasonable download size' },
+  // dtype: 'fp32' is required here — unlike the model above, this repo only
+  // publishes the raw fp32 ONNX export, no quantized variants. Without
+  // forcing it, the library defaults to requesting a quantized file that
+  // doesn't exist in this repo and the load 404s.
+  { id: 'MoritzLaurer/deberta-v3-base-zeroshot-v2.0', label: 'deberta-v3-base-zeroshot-v2.0', size: '~740MB', dtype: 'fp32', quality: 86, desc: '86% on our test, the most accurate option — but a much bigger download (no quantized version of this one exists), so it is not the default' },
+  { id: 'Xenova/mobilebert-uncased-mnli', label: 'mobilebert-uncased-mnli', size: '~100MB', quality: 50, desc: '50% on our test, much smaller — but it missed every single contradiction case in testing (called them "unrelated" instead). Fine for a quick supported/unsupported check, unreliable for catching errors — the retry/contradiction-hunting feature depends on the model actually recognizing a contradiction' },
+];
+const RETRIEVAL_METHODS = [
+  { id: 'rerank',     label: 'BM25 then rerank', desc: 'Default — BM25 top-30, embeddings rerank to top-5' },
+  { id: 'bm25',        label: 'BM25 only',        desc: 'No embedding model download, fastest, least precise' },
+  { id: 'embeddings',  label: 'Embeddings only',  desc: 'Semantic search, handles vocabulary mismatch' },
+];
 
 const CHUNK_WORDS = 900;
 
 // ── File reading ──────────────────────────────────────────────────────────────
+// `.text` is always the real extracted text (used by the local browser
+// pipeline, for chunking, and now as the PDF fallback for every LLM provider
+// except Anthropic — see filePart below).
 async function readFile(file) {
   const ext = file.name.split('.').pop().toLowerCase();
   if (ext === 'docx') {
-    const ab  = await file.arrayBuffer();
-    const res = await mammoth.extractRawText({ arrayBuffer: ab });
-    return { name: file.name, type: 'text', content: res.value };
+    const text = await extractDocxText(file);
+    return { name: file.name, type: 'text', content: text, text };
   }
   if (ext === 'pdf') {
-    const ab  = await file.arrayBuffer();
+    const [ab, text] = await Promise.all([file.arrayBuffer(), extractPdfText(file)]);
     const u8  = new Uint8Array(ab);
     let bin   = '';
     for (let i = 0; i < u8.length; i += 8192)
       bin += String.fromCharCode(...u8.slice(i, i + 8192));
-    return { name: file.name, type: 'pdf', b64: btoa(bin) };
+    return { name: file.name, type: 'pdf', b64: btoa(bin), text };
   }
-  return { name: file.name, type: 'text', content: await file.text() };
+  const text = await file.text();
+  return { name: file.name, type: 'text', content: text, text };
 }
 
-function filePart(doc, label = 'SOURCE') {
-  if (doc.type === 'pdf')
+// Anthropic reads PDF bytes natively (better on tables/figures/layout); every
+// other provider gets the pdfjs-extracted text instead of being blocked
+// outright — real PDF support everywhere, just not the same fidelity.
+function filePart(doc, label = 'SOURCE', kind = 'anthropic') {
+  if (doc.type === 'pdf' && kind === 'anthropic')
     return { type: 'document',
              source: { type: 'base64', media_type: 'application/pdf', data: doc.b64 } };
-  return { type: 'text', text: `[${label}: ${doc.name}]\n${doc.content}` };
+  const text = doc.type === 'pdf' ? doc.text : doc.content;
+  return { type: 'text', text: `[${label}: ${doc.name}]\n${text}` };
 }
 
 // Marks the last source block as an Anthropic prompt-cache breakpoint, since
 // chunking means the same source documents get resent on every single call —
 // caching them keeps that from multiplying token cost by the chunk count.
 function buildRefParts(refs, kind) {
-  const parts = refs.map(doc => filePart(doc, 'SOURCE'));
+  const parts = refs.map(doc => filePart(doc, 'SOURCE', kind));
   if (kind === 'anthropic' && parts.length)
     parts[parts.length - 1] = { ...parts[parts.length - 1], cache_control: { type: 'ephemeral' } };
   return parts;
@@ -131,7 +183,9 @@ CITED CLAIMS: claims that carry an explicit citation (e.g. "(Smith, 2020)", "[3]
 UNCITED CLAIMS: factual, empirical, or statistical statements with no citation attached at all. Do not verify these against the sources — surface them so the author can confirm each is their own analysis, a restatement of something cited nearby, or common knowledge, rather than something that needed a source. Skip connective sentences, methodology narration, and clear opinion/argument. List up to 12 of the most notable.
 
 Return ONLY valid JSON, no markdown fences:
-{"citedClaims":[{"claim":"exact claim, max 90 chars","citation":"as it appears in the text","status":"SUPPORTED|PARTIAL|UNSUPPORTED|CONTRADICTED","evidence":"exact quote from source, max 15 words, or 'not found in sources'","explanation":"one sentence, max 80 chars","source":"exact filename, or 'none'","confidence":"HIGH|MEDIUM|LOW"}],"uncitedClaims":[{"claim":"claim text max 90 chars","note":"max 70 chars"}]}`;
+{"citedClaims":[{"claim":"exact claim, max 90 chars","citation":"as it appears in the text","status":"SUPPORTED|PARTIAL|UNSUPPORTED|CONTRADICTED","evidence":"exact quote from source, max 15 words, or 'not found in sources'","explanation":"one sentence, max 80 chars","source":"exact filename, or 'none'","confidence":"HIGH|MEDIUM|LOW"}],"uncitedClaims":[{"claim":"claim text max 90 chars","note":"max 70 chars"}]}
+
+Your entire response must be that JSON object and nothing else. No preamble like "Here is the JSON:", no explanation before or after it, no markdown code fence. The first character of your response must be {`;
 }
 
 const CONTRADICTION_INSTRUCTIONS = `You are hunting specifically for contradictions. Ignore whether claims are supported — that is checked separately. Your only job here is adversarial: actively look for any place where a SOURCE document says something that conflicts with, or gives a different fact or number than, the paper.
@@ -140,10 +194,39 @@ ${ABSOLUTE_RULES}
 
 Return ONLY valid JSON, no markdown fences:
 {"contradictions":[{"claim":"the paper's claim, max 90 chars","evidence":"exact contradicting quote from a source, max 15 words","source":"exact filename","explanation":"what conflicts, max 80 chars"}]}
-If you find none, return {"contradictions":[]}.`;
+If you find none, return {"contradictions":[]}.
+
+Your entire response must be that JSON object and nothing else. No preamble, no explanation, no markdown code fence. The first character of your response must be {`;
 
 // ── LLM call ──────────────────────────────────────────────────────────────────
-async function callLLM({ kind, apiKey, baseUrl, model, parts, instructions }) {
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+
+// Pulls the first complete top-level JSON object out of a model's raw text,
+// tolerating preamble/commentary a weaker model adds despite being told not
+// to (e.g. "Here's the JSON:\n{...}"). Brace-counted so nested objects and
+// arrays inside the payload don't confuse it.
+function extractJsonObject(raw) {
+  const cleaned = raw.replace(/```json|```/g, '').trim();
+  const start = cleaned.indexOf('{');
+  if (start === -1) return cleaned;
+  let depth = 0;
+  for (let i = start; i < cleaned.length; i++) {
+    if (cleaned[i] === '{') depth++;
+    else if (cleaned[i] === '}') { depth--; if (depth === 0) return cleaned.slice(start, i + 1); }
+  }
+  return cleaned.slice(start);
+}
+
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 2500;
+
+// Retries on both connection failures and malformed JSON — local/weaker
+// models are far more prone to both under memory pressure or long prompts
+// than large hosted ones, and a short pause plus another try clears most of
+// them. Trades time for reliability on purpose: this app has to work with
+// whatever model the person in front of it can actually run, not just the
+// biggest hosted ones.
+async function callLLM({ kind, apiKey, baseUrl, model, parts, instructions, onRetry }, attempt = 1) {
   let url, headers, body, extractText;
 
   if (kind === 'anthropic') {
@@ -161,18 +244,60 @@ async function callLLM({ kind, apiKey, baseUrl, model, parts, instructions }) {
     url = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
     headers = { 'Content-Type': 'application/json' };
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    body = { model, messages: [{ role: 'user', content: `${textBlocks}\n\n${instructions}` }], temperature: 0 };
+    body = { model, messages: [{ role: 'user', content: `${textBlocks}\n\n${instructions}` }], temperature: 0, max_tokens: 2000 };
     extractText = d => d.choices?.[0]?.message?.content || '';
   }
 
-  const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const retry = async errFactory => {
+    if (attempt < MAX_ATTEMPTS) {
+      onRetry?.(attempt, MAX_ATTEMPTS);
+      await sleep(RETRY_DELAY_MS * attempt);
+      return callLLM({ kind, apiKey, baseUrl, model, parts, instructions, onRetry }, attempt + 1);
+    }
+    throw errFactory();
+  };
+
+  let r;
+  try {
+    r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  } catch (e) {
+    return retry(() => {
+      const origin = typeof window !== 'undefined' ? window.location.origin : 'this app\'s URL';
+      return new Error(
+        `Could not reach ${url} after ${MAX_ATTEMPTS} attempts. The request never got a response, which ` +
+        `almost always means CORS or connectivity, not something wrong with your paper or prompt. Checklist: ` +
+        `is the server actually running at that address? If it's a local server (Ollama, LM Studio, vLLM, ` +
+        `etc.), does its CORS config allow requests from this exact origin — ${origin}? For Ollama: restart ` +
+        `it with OLLAMA_ORIGINS=${origin} ollama serve. If it kept working then failing, check your machine ` +
+        `isn't running low on memory — local models can crash or hang under memory pressure. (Raw browser ` +
+        `error: ${e.message})`
+      );
+    });
+  }
+
+  // 429/5xx are worth retrying (rate limits, transient server trouble under
+  // load); 4xx like a bad key or bad model name will just fail identically
+  // again, so surface those immediately instead of wasting two more tries.
   if (!r.ok) {
     const errBody = await r.text().catch(() => '');
+    if (r.status === 429 || r.status >= 500) {
+      return retry(() => new Error(`API ${r.status} after ${MAX_ATTEMPTS} attempts${errBody ? ': ' + errBody.slice(0, 200) : ''}`));
+    }
     throw new Error(`API ${r.status}${errBody ? ': ' + errBody.slice(0, 200) : ''}`);
   }
+
   const d = await r.json();
   const raw = extractText(d);
-  return JSON.parse(raw.replace(/```json|```/g, '').trim());
+  try {
+    return JSON.parse(extractJsonObject(raw));
+  } catch (e) {
+    return retry(() => new Error(
+      `The model didn't return valid JSON after ${MAX_ATTEMPTS} attempts. Smaller or local models can ` +
+      `struggle to follow a strict "JSON only" instruction on a long prompt — a larger local model (7B+ ` +
+      `instruct-tuned) is usually far more reliable, or try a hosted provider. What it actually sent back: ` +
+      `"${raw.slice(0, 200)}"`
+    ));
+  }
 }
 
 function summarize(cited, uncited, contradictions) {
@@ -372,8 +497,151 @@ function Footer() {
   );
 }
 
+function ProviderCard({ selected, title, badge, desc, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 4,
+      background: selected ? C.tealBg : C.card, border: `1px solid ${selected ? C.teal : C.border}`,
+      borderRadius: 10, padding: '13px 15px', cursor: 'pointer',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 13.5, fontWeight: 600, color: selected ? C.teal : C.text }}>{title}</span>
+        {badge && (
+          <span style={{ fontSize: 9.5, fontWeight: 700, color: C.teal, border: `1px solid ${C.teal}55`, borderRadius: 4, padding: '2px 6px', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+            {badge}
+          </span>
+        )}
+      </div>
+      <div style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.55 }}>{desc}</div>
+    </button>
+  );
+}
+
+// The "type a name, we fill in the rest if we know it" box for bring-your-
+// own-key providers. Typing shows matching known providers as clickable
+// chips; clicking one (or typing a full name and moving on) fills base
+// URL/model instantly. An unrecognized name just becomes a custom entry —
+// someone typing their own provider's name presumably already has the
+// base URL and model in hand.
+function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, customProviderName,
+                          onProvider, onBaseUrl, onModel, onApiKey, onToggleHunt, onCustomProviderName }) {
+  const startingName = API_KEY_PROVIDERS.includes(provider)
+    ? PROVIDER_DEFAULTS[provider].label
+    : (provider === 'custom' ? customProviderName : '');
+  const [nameInput, setNameInput] = useState(startingName);
+  const [resolved, setResolved] = useState(!!startingName);
+  const suggestions = resolved ? [] : matchApiProviders(nameInput);
+
+  const commitMatch = key => {
+    onProvider(key);
+    setNameInput(PROVIDER_DEFAULTS[key].label);
+    setResolved(true);
+  };
+  const commitCustom = () => {
+    const name = nameInput.trim();
+    if (!name) { setResolved(false); return; }
+    if (suggestions.length === 1) { commitMatch(suggestions[0].key); return; }
+    onProvider('custom');
+    onCustomProviderName(name);
+    setResolved(true);
+  };
+
+  return (
+    <>
+      <div>
+        <div style={fieldLabelStyle}>Provider name</div>
+        <input
+          value={nameInput}
+          onChange={e => { setNameInput(e.target.value); setResolved(false); }}
+          onBlur={commitCustom}
+          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitCustom(); } }}
+          placeholder="e.g. claude, deepseek, openrouter…"
+          style={inputStyle}
+        />
+        {!resolved && suggestions.length > 0 && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+            {suggestions.map(s => (
+              <button key={s.key} onMouseDown={e => e.preventDefault()} onClick={() => commitMatch(s.key)} style={{
+                background: C.card, border: `1px solid ${C.teal}55`, color: C.teal, borderRadius: 6,
+                padding: '5px 10px', fontSize: 11.5, cursor: 'pointer',
+              }}>
+                {s.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {!resolved && nameInput.trim() && !suggestions.length && (
+          <div style={{ fontSize: 11, color: C.faint, marginTop: 6, lineHeight: 1.5 }}>
+            Not one we recognize — that's fine, click away and fill in the base URL and model yourself below.
+          </div>
+        )}
+      </div>
+
+      {resolved && (
+        <>
+          {PROVIDER_DEFAULTS[provider]?.kind !== 'anthropic' && (
+            <div>
+              <div style={fieldLabelStyle}>Base URL</div>
+              <input value={baseUrl} onChange={e => onBaseUrl(e.target.value)} placeholder="e.g. https://api.example.com/v1" style={inputStyle} />
+            </div>
+          )}
+          <div>
+            <div style={fieldLabelStyle}>Model</div>
+            <input value={model} onChange={e => onModel(e.target.value)} placeholder="Model name" style={inputStyle} />
+          </div>
+          <div>
+            <div style={fieldLabelStyle}>API key</div>
+            <input type="password" value={apiKey} onChange={e => onApiKey(e.target.value)} placeholder="API key" style={inputStyle} />
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 13, color: C.muted, cursor: 'pointer' }}>
+            <input type="checkbox" checked={huntContradictions} onChange={onToggleHunt} />
+            Hunt for contradictions (separate pass, ~2× calls)
+          </label>
+          <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.65 }}>
+            Stored only in this browser (localStorage), sent only to the base URL above.
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+function LocalAiFields({ baseUrl, model, apiKey, huntContradictions, onBaseUrl, onModel, onApiKey, onToggleHunt }) {
+  return (
+    <>
+      <div>
+        <div style={fieldLabelStyle}>Base URL</div>
+        <input value={baseUrl} onChange={e => onBaseUrl(e.target.value)} placeholder="e.g. http://localhost:11434/v1" style={inputStyle} />
+      </div>
+      <div>
+        <div style={fieldLabelStyle}>Model</div>
+        <input value={model} onChange={e => onModel(e.target.value)} placeholder="Model name" style={inputStyle} />
+      </div>
+      <div>
+        <div style={fieldLabelStyle}>API key</div>
+        <input type="password" value={apiKey} onChange={e => onApiKey(e.target.value)} placeholder="Optional for local servers" style={inputStyle} />
+      </div>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 13, color: C.muted, cursor: 'pointer' }}>
+        <input type="checkbox" checked={huntContradictions} onChange={onToggleHunt} />
+        Hunt for contradictions (separate pass, ~2× calls)
+      </label>
+      <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.65 }}>
+        Stored only in this browser (localStorage), sent only to the base URL above.
+      </div>
+    </>
+  );
+}
+
 function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, providerInfo,
-                          onProvider, onBaseUrl, onModel, onApiKey, onToggleHunt, onClose }) {
+                          embedModel, nliModel, retrievalMethod, customProviderName,
+                          onProvider, onBaseUrl, onModel, onApiKey, onToggleHunt, onClose,
+                          onEmbedModel, onNliModel, onRetrieval, onCustomProviderName }) {
+  const [showApiProviders, setShowApiProviders] = useState(
+    () => API_KEY_PROVIDERS.includes(provider) || provider === 'custom'
+  );
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const selectTier = key => { onProvider(key); setShowApiProviders(false); };
+
   return (
     <div onClick={onClose} style={{
       position: 'fixed', inset: 0, background: 'rgba(4,7,14,0.72)', backdropFilter: 'blur(2px)',
@@ -381,7 +649,8 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
     }}>
       <div onClick={e => e.stopPropagation()} style={{
         background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16,
-        padding: '32px 34px', width: '100%', maxWidth: 440, boxShadow: '0 24px 70px rgba(0,0,0,0.55)',
+        padding: '32px 34px', width: '100%', maxWidth: 460, maxHeight: '85vh', overflowY: 'auto',
+        boxShadow: '0 24px 70px rgba(0,0,0,0.55)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 26 }}>
           <div style={{ fontSize: 17, fontWeight: 700 }}>Connection</div>
@@ -393,33 +662,78 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <div>
             <div style={fieldLabelStyle}>Provider</div>
-            <select value={provider} onChange={e => onProvider(e.target.value)} style={inputStyle}>
-              {Object.entries(PROVIDER_DEFAULTS).map(([key, d]) => <option key={key} value={key}>{d.label}</option>)}
-            </select>
-          </div>
-          {provider !== 'anthropic' && (
-            <div>
-              <div style={fieldLabelStyle}>Base URL</div>
-              <input value={baseUrl} onChange={e => onBaseUrl(e.target.value)} placeholder="API base URL" style={inputStyle} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <ProviderCard
+                selected={provider === 'browser' && !showApiProviders} badge="Recommended"
+                title={PROVIDER_DEFAULTS.browser.label}
+                desc="Runs fully in your browser. Your paper, sources, and results never leave your device — nothing is uploaded anywhere, no account needed, and it keeps working offline after the first load."
+                onClick={() => selectTier('browser')}
+              />
+              <ProviderCard
+                selected={provider === 'local' && !showApiProviders}
+                title={PROVIDER_DEFAULTS.local.label}
+                desc="Point at a model server running on your own machine (e.g. Ollama) for LLM-quality reasoning without an API key — needs that server running and a bit of setup."
+                onClick={() => selectTier('local')}
+              />
+              <button onClick={() => setShowApiProviders(v => !v)} style={{
+                background: 'none', border: 'none', color: C.teal, cursor: 'pointer',
+                fontSize: 12, textAlign: 'left', padding: '4px 2px',
+              }}>
+                {showApiProviders ? 'Hide' : 'Or bring your own API key (Claude, DeepSeek, OpenRouter…)'}
+              </button>
             </div>
+          </div>
+
+          {showApiProviders ? (
+            <ApiKeySection
+              provider={provider} baseUrl={baseUrl} model={model} apiKey={apiKey}
+              huntContradictions={huntContradictions} customProviderName={customProviderName}
+              onProvider={onProvider} onBaseUrl={onBaseUrl} onModel={onModel} onApiKey={onApiKey}
+              onToggleHunt={onToggleHunt} onCustomProviderName={onCustomProviderName}
+            />
+          ) : provider === 'browser' ? (
+            <>
+              <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.65, background: C.tealBg, border: `1px solid ${C.teal}22`, borderRadius: 8, padding: '10px 12px' }}>
+                No API key, no account, no server. Two models download once to this browser and are cached — after that it works offline. Quality is more limited than an LLM-based provider (rule-based claim detection, embedding + NLI reasoning instead of full language understanding), but there's nothing to pay for and nothing to configure. The defaults are already the best-measured options below (real test results, not a guess) — most people don't need to open "Advanced."
+              </div>
+              <button onClick={() => setShowAdvanced(v => !v)} style={{
+                background: 'none', border: 'none', color: C.teal, cursor: 'pointer',
+                fontSize: 12, textAlign: 'left', padding: '4px 2px', display: 'flex', alignItems: 'center', gap: 5,
+              }}>
+                {showAdvanced ? <ChevronUp size={13} /> : <ChevronDown size={13} />} Advanced model settings
+              </button>
+              {showAdvanced && (
+                <>
+                  <div>
+                    <div style={fieldLabelStyle}>Embedding model (retrieval)</div>
+                    <select value={embedModel} onChange={e => onEmbedModel(e.target.value)} style={inputStyle}>
+                      {EMBED_MODELS.map(m => <option key={m.id} value={m.id}>{m.label} — {m.size}{m.quality != null ? ` — ${m.quality}% on our test set` : ''}</option>)}
+                    </select>
+                    <div style={{ fontSize: 11, color: C.faint, marginTop: 4 }}>{EMBED_MODELS.find(m => m.id === embedModel)?.desc}</div>
+                  </div>
+                  <div>
+                    <div style={fieldLabelStyle}>NLI model (reasoning)</div>
+                    <select value={nliModel} onChange={e => onNliModel(e.target.value)} style={inputStyle}>
+                      {NLI_MODELS.map(m => <option key={m.id} value={m.id}>{m.label} — {m.size}{m.quality != null ? ` — ${m.quality}% on our test set` : ''}</option>)}
+                    </select>
+                    <div style={{ fontSize: 11, color: C.faint, marginTop: 4 }}>{NLI_MODELS.find(m => m.id === nliModel)?.desc}</div>
+                  </div>
+                  <div>
+                    <div style={fieldLabelStyle}>Retrieval method</div>
+                    <select value={retrievalMethod} onChange={e => onRetrieval(e.target.value)} style={inputStyle}>
+                      {RETRIEVAL_METHODS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+                    </select>
+                    <div style={{ fontSize: 11, color: C.faint, marginTop: 4 }}>{RETRIEVAL_METHODS.find(m => m.id === retrievalMethod)?.desc}</div>
+                  </div>
+                </>
+              )}
+            </>
+          ) : (
+            <LocalAiFields
+              baseUrl={baseUrl} model={model} apiKey={apiKey} huntContradictions={huntContradictions}
+              onBaseUrl={onBaseUrl} onModel={onModel} onApiKey={onApiKey} onToggleHunt={onToggleHunt}
+            />
           )}
-          <div>
-            <div style={fieldLabelStyle}>Model</div>
-            <input value={model} onChange={e => onModel(e.target.value)} placeholder="Model name" style={inputStyle} />
-          </div>
-          <div>
-            <div style={fieldLabelStyle}>API key</div>
-            <input type="password" value={apiKey} onChange={e => onApiKey(e.target.value)}
-                   placeholder={providerInfo.keyRequired ? 'API key' : 'Optional for local servers'} style={inputStyle} />
-          </div>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 13, color: C.muted, cursor: 'pointer' }}>
-            <input type="checkbox" checked={huntContradictions} onChange={onToggleHunt} />
-            Hunt for contradictions (separate pass, ~2× calls)
-          </label>
-          <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.65 }}>
-            Stored only in this browser (localStorage), sent only to the base URL above.
-            {!providerInfo.supportsPdf && ' This provider reads text only — PDFs need Anthropic.'}
-          </div>
         </div>
 
         <button onClick={onClose} style={{
@@ -435,12 +749,16 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function Loupe() {
-  const [provider, setProvider] = useState(() => localStorage.getItem('sv_provider') || 'anthropic');
+  const [provider, setProvider] = useState(() => localStorage.getItem('sv_provider') || 'browser');
   const [apiKey,   setApiKey]   = useState(() => localStorage.getItem('sv_api_key') || '');
-  const [baseUrl,  setBaseUrl]  = useState(() => localStorage.getItem('sv_base_url') || PROVIDER_DEFAULTS.anthropic.baseUrl);
-  const [model,    setModel]    = useState(() => localStorage.getItem('sv_model') || PROVIDER_DEFAULTS.anthropic.model);
+  const [baseUrl,  setBaseUrl]  = useState(() => localStorage.getItem('sv_base_url') || PROVIDER_DEFAULTS.browser.baseUrl);
+  const [model,    setModel]    = useState(() => localStorage.getItem('sv_model') || PROVIDER_DEFAULTS.browser.model);
   const [showSettings, setShowSettings] = useState(false);
   const [huntContradictions, setHuntContradictions] = useState(() => localStorage.getItem('sv_hunt') !== '0');
+  const [embedModel, setEmbedModel] = useState(() => localStorage.getItem('sv_embed_model') || EMBED_MODELS[0].id);
+  const [nliModel, setNliModel]     = useState(() => localStorage.getItem('sv_nli_model') || NLI_MODELS[0].id);
+  const [retrievalMethod, setRetrievalMethod] = useState(() => localStorage.getItem('sv_retrieval') || RETRIEVAL_METHODS[0].id);
+  const [customProviderName, setCustomProviderName] = useState(() => localStorage.getItem('sv_custom_name') || '');
 
   const [paper,    setPaper]    = useState(null);
   const [paperTxt, setPaperTxt] = useState('');
@@ -449,15 +767,28 @@ export default function Loupe() {
   const [loading,  setLoading]  = useState(false);
   const [runStatus, setRunStatus] = useState('');
   const [liveChunk, setLiveChunk] = useState(null); // { current, total } for the active run only
+  const [modelProgress, setModelProgress] = useState(null); // browser-pipeline model download progress
   const [err,      setErr]      = useState(null);
   const [copied,   setCopied]   = useState(false);
   const [progress, setProgress] = useState(null); // paused/resumable snapshot, persisted
   const progressUpload = useRef();
+  const workerRef = useRef(null);
 
   const providerInfo = PROVIDER_DEFAULTS[provider];
 
   useEffect(() => {
-    try { const raw = localStorage.getItem('sv_progress'); if (raw) setProgress(JSON.parse(raw)); } catch {}
+    try {
+      const raw = localStorage.getItem('sv_progress');
+      if (!raw) return;
+      const snap = JSON.parse(raw);
+      setProgress(snap);
+      // A page reload wipes React state (paper/refs) even though this
+      // snapshot survives in localStorage — without restoring them here,
+      // clicking Resume would silently run with zero reference sources.
+      setPaper(snap.paper || null);
+      setPaperTxt(snap.paperTxt || snap.paper?.content || '');
+      setRefs(snap.refs || []);
+    } catch {}
   }, []);
 
   const handleProvider = p => {
@@ -470,6 +801,17 @@ export default function Loupe() {
   const handleBaseUrl = v => { setBaseUrl(v); localStorage.setItem('sv_base_url', v); };
   const handleModel   = v => { setModel(v);   localStorage.setItem('sv_model', v); };
   const toggleHunt = () => { const v = !huntContradictions; setHuntContradictions(v); localStorage.setItem('sv_hunt', v ? '1' : '0'); };
+  const handleEmbedModel = v => { setEmbedModel(v); localStorage.setItem('sv_embed_model', v); };
+  const handleNliModel = v => { setNliModel(v); localStorage.setItem('sv_nli_model', v); };
+  const handleRetrieval = v => { setRetrievalMethod(v); localStorage.setItem('sv_retrieval', v); };
+  const handleCustomProviderName = v => { setCustomProviderName(v); localStorage.setItem('sv_custom_name', v); };
+
+  const getWorker = () => {
+    if (!workerRef.current) {
+      workerRef.current = new Worker(new URL('./workers/inference.worker.js', import.meta.url), { type: 'module' });
+    }
+    return workerRef.current;
+  };
 
   const handlePaper = async file => {
     try { const d = await readFile(file); setPaper(d); setPaperTxt(d.content || ''); }
@@ -503,7 +845,7 @@ export default function Loupe() {
       const snap = JSON.parse(await file.text());
       saveProgress(snap);
       setPaper(snap.paper || null);
-      setPaperTxt(snap.paper?.content || '');
+      setPaperTxt(snap.paperTxt || snap.paper?.content || '');
       setRefs(snap.refs || []);
       setErr(null);
     } catch (e) { setErr('Could not read progress file: ' + e.message); }
@@ -511,22 +853,21 @@ export default function Loupe() {
 
   // Shared by both a fresh run and a resume — resuming must not skip these.
   const validate = ({ forResume } = {}) => {
-    const hasPdf = paper?.type === 'pdf' || refs.some(r => r.type === 'pdf');
-    if (providerInfo.keyRequired && !apiKey.trim()) return `Enter your ${providerInfo.label} API key.`;
-    if (!baseUrl.trim()) return 'Enter the API base URL.';
-    if (!model.trim()) return 'Enter a model name.';
-    if (hasPdf && !providerInfo.supportsPdf) return 'PDF files need the Anthropic provider — switch provider, or replace the PDF with .txt/.docx.';
+    if (providerInfo.kind !== 'browser') {
+      if (providerInfo.keyRequired && !apiKey.trim()) return `Enter your ${providerInfo.label} API key.`;
+      if (!baseUrl.trim()) return 'Enter the API base URL.';
+      if (!model.trim()) return 'Enter a model name.';
+    }
     if (!forResume) {
-      const text = paperTxt.trim() || paper?.content || '';
-      const hasPaper = !!text || paper?.type === 'pdf';
-      if (!hasPaper) return 'No paper text to verify.';
+      const text = paperTxt.trim() || paper?.content || paper?.text || '';
+      if (!text) return 'No paper text to verify.';
       if (!refs.length) return 'Upload at least one reference source.';
     }
     return null;
   };
 
   const runChunked = async resumeFrom => {
-    const text = paperTxt.trim() || paper?.content || '';
+    const text = paperTxt.trim() || paper?.content || paper?.text || '';
     const chunks = resumeFrom?.chunks || chunkText(text);
     let cited = resumeFrom?.citedClaims || [];
     let uncited = resumeFrom?.uncitedClaims || [];
@@ -540,10 +881,13 @@ export default function Loupe() {
     for (; i < chunks.length; i++) {
       setRunStatus(`Checking chunk ${i + 1} of ${chunks.length}…`);
       const paperParts = [{ type: 'text', text: `[PAPER EXCERPT ${i + 1}/${chunks.length}]\n${chunks[i]}` }];
+      const retryStatus = (attempt, max) =>
+        setRunStatus(`Checking chunk ${i + 1} of ${chunks.length} — response wasn't usable, retrying (${attempt}/${max - 1})…`);
       try {
         const verdict = await callLLM({
           kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
           parts: [...refParts, ...paperParts], instructions: claimInstructions({ whole: false }),
+          onRetry: retryStatus,
         });
         cited = cited.concat(verdict.citedClaims || []);
         uncited = uncited.concat(verdict.uncitedClaims || []);
@@ -553,11 +897,12 @@ export default function Loupe() {
           const cv = await callLLM({
             kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
             parts: [...refParts, ...paperParts], instructions: CONTRADICTION_INSTRUCTIONS,
+            onRetry: retryStatus,
           });
           contradictions = contradictions.concat(cv.contradictions || []);
         }
       } catch (e) {
-        const snap = { chunks, chunkIndex: i, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, refs };
+        const snap = { chunks, chunkIndex: i, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, paperTxt: text, refs };
         saveProgress(snap);
         setLoading(false);
         setLiveChunk(null);
@@ -565,7 +910,7 @@ export default function Loupe() {
         return;
       }
       setLiveChunk({ current: i + 1, total: chunks.length });
-      saveProgress({ chunks, chunkIndex: i + 1, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, refs });
+      saveProgress({ chunks, chunkIndex: i + 1, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, paperTxt: text, refs });
     }
 
     setResult(buildFinalResult(cited, uncited, contradictions));
@@ -579,11 +924,14 @@ export default function Loupe() {
     setLoading(true); setErr(null); setResult(null);
     setRunStatus('Reading sources and checking claims…');
     const refParts = buildRefParts(refs, providerInfo.kind);
-    const paperParts = [filePart(paper, 'PAPER'), { type: 'text', text: '[The document above is the PAPER TO VERIFY]' }];
+    const paperParts = [filePart(paper, 'PAPER', providerInfo.kind), { type: 'text', text: '[The document above is the PAPER TO VERIFY]' }];
+    const retryStatus = (attempt, max) =>
+      setRunStatus(`Response wasn't usable, retrying (${attempt}/${max - 1})…`);
     try {
       const verdict = await callLLM({
         kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
         parts: [...refParts, ...paperParts], instructions: claimInstructions({ whole: true }),
+        onRetry: retryStatus,
       });
       let contradictions = [];
       if (huntContradictions) {
@@ -591,6 +939,7 @@ export default function Loupe() {
         const cv = await callLLM({
           kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
           parts: [...refParts, ...paperParts], instructions: CONTRADICTION_INSTRUCTIONS,
+          onRetry: retryStatus,
         });
         contradictions = cv.contradictions || [];
       }
@@ -599,15 +948,98 @@ export default function Loupe() {
     finally { setLoading(false); setRunStatus(''); }
   };
 
+  // Runs entirely client-side: BM25 + embedding rerank to find the most
+  // relevant reference sentences per claim, then an NLI model decides
+  // support/contradiction/neutral. No network calls once the two models are
+  // cached — this is the zero-API-key, zero-account path.
+  const runBrowserVerification = async () => {
+    setLoading(true); setErr(null); setResult(null); setModelProgress({});
+    const worker = getWorker();
+    const paperText = paper?.text || paperTxt.trim();
+    const allClaims = extractClaims(paperText);
+    const citedCandidates = allClaims.filter(c => c.hasCitation);
+    const uncitedClaims = allClaims
+      .filter(c => c.autoSelected && !c.hasCitation)
+      .map(c => ({ claim: c.text, note: 'Flagged by local rules (number, comparison, or reasoning verb) — no citation attached.' }));
+
+    const onMessage = (resolveType, onMsg) => new Promise((resolve, reject) => {
+      const handler = e => {
+        const msg = e.data;
+        if (msg.type === 'ERROR') { worker.removeEventListener('message', handler); reject(new Error(msg.message)); return; }
+        if (msg.type === resolveType) { worker.removeEventListener('message', handler); resolve(msg); return; }
+        onMsg?.(msg);
+      };
+      worker.addEventListener('message', handler);
+    });
+
+    try {
+      setRunStatus('Loading local models (first run downloads them, then they\'re cached)…');
+      const modelsReady = onMessage('MODELS_READY', msg => {
+        if (msg.type === 'MODEL_PROGRESS') setModelProgress(prev => ({ ...prev, [msg.model]: msg }));
+      });
+      const nliDtype = NLI_MODELS.find(m => m.id === nliModel)?.dtype;
+      worker.postMessage({ type: 'LOAD_MODELS', embedModel, nliModel, retrievalMethod, nliDtype });
+      await modelsReady;
+      setModelProgress(null);
+
+      const refSentences = refs.flatMap(r => chunkReferenceIntoSentences(r.name, r.text || r.content || ''));
+      setRunStatus(`Indexing ${refSentences.length} sentences from ${refs.length} source${refs.length !== 1 ? 's' : ''}…`);
+      const indexed = onMessage('INDEXED', msg => {
+        if (msg.type === 'INDEX_PROGRESS') setRunStatus(`Indexing sentence ${msg.done} of ${msg.total}…`);
+      });
+      worker.postMessage({ type: 'INDEX', sentences: refSentences, retrievalMethod });
+      await indexed;
+
+      setRunStatus(`Checking ${citedCandidates.length} cited claim${citedCandidates.length !== 1 ? 's' : ''}…`);
+      const citedClaims = [];
+      const contradictions = [];
+      let done = 0;
+      const verified = onMessage('VERIFY_DONE', msg => {
+        if (msg.type !== 'CLAIM_RESULT') return;
+        done++;
+        setRunStatus(`Checking claim ${done} of ${citedCandidates.length}…`);
+        const claim = citedCandidates.find(c => c.index === msg.claimIndex);
+        const r = msg.result;
+        const explanation = r.nliScores
+          ? `Cosine ${r.cosineSim.toFixed(2)}, NLI ${Math.round(Math.max(r.nliScores.supported, r.nliScores.contradicted) * 100)}%`
+          : 'No sufficiently similar passage found in sources.';
+        const entry = { claim: claim.text, citation: claim.citationText || '', status: r.status, evidence: r.evidence, source: r.source, confidence: r.confidence, explanation };
+        citedClaims.push(entry);
+        if (r.status === 'CONTRADICTED') contradictions.push({ claim: claim.text, evidence: r.evidence, source: r.source, explanation });
+      });
+      worker.postMessage({ type: 'VERIFY', claims: citedCandidates, retrievalMethod });
+      await verified;
+
+      setResult(buildFinalResult(citedClaims, uncitedClaims, contradictions));
+    } catch (e) {
+      setErr('Verification failed: ' + e.message);
+    } finally {
+      setLoading(false); setRunStatus(''); setModelProgress(null);
+    }
+  };
+
   const run = () => {
     const problem = validate();
     if (problem) { setErr(problem); return; }
-    if (paper?.type === 'pdf') runWholeDocument();
+    if (providerInfo.kind === 'browser') runBrowserVerification();
+    // Only Anthropic reads a PDF's raw bytes natively, so only it needs the
+    // single whole-document pass — every other provider now has real
+    // extracted text for a PDF paper too, so it can chunk it like any other.
+    else if (paper?.type === 'pdf' && providerInfo.kind === 'anthropic') runWholeDocument();
     else runChunked();
   };
 
   const resume = () => {
     if (!progress) return;
+    // This paused snapshot only ever comes from the LLM-provider chunked
+    // path — the local browser pipeline has no resumability of its own.
+    // Without this check, resuming while "Local — no API key, no setup" is
+    // active would silently try an LLM-style request with an empty base
+    // URL and fail confusingly far from the button that triggered it.
+    if (providerInfo.kind === 'browser') {
+      setErr('This paused run is from an AI-provider verification, not the local browser pipeline — switch to the provider you were using (via the settings icon) and click Resume again.');
+      return;
+    }
     const problem = validate({ forResume: true });
     if (problem) { setErr(problem); return; }
     runChunked(progress);
@@ -634,11 +1066,18 @@ export default function Loupe() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const paperText = paperTxt.trim() || paper?.content || '';
-  const hasPaper  = !!paperText || paper?.type === 'pdf';
+  const paperText = paperTxt.trim() || paper?.content || paper?.text || '';
+  const hasPaper  = !!paperText;
   const canRun    = (!providerInfo.keyRequired || !!apiKey.trim()) && hasPaper && refs.length > 0 && !loading;
-  const isChunkable = paper?.type !== 'pdf' && paperText;
+  // Chunkable for every provider now except Anthropic+PDF, which stays a
+  // single native-PDF pass (see the run() dispatcher for why).
+  const singlePassPdf = paper?.type === 'pdf' && providerInfo.kind === 'anthropic';
+  const isChunkable = providerInfo.kind !== 'browser' && !singlePassPdf && paperText;
   const estChunks = isChunkable ? chunkText(paperText).length : 1;
+  const browserPaperText = paper?.text || paperTxt.trim();
+  const browserClaimEstimate = providerInfo.kind === 'browser' && browserPaperText
+    ? extractClaims(browserPaperText).filter(c => c.hasCitation).length
+    : 0;
   const estCalls  = estChunks * (huntContradictions ? 2 : 1);
   const isPaused  = progress && progress.chunkIndex < progress.chunks?.length;
 
@@ -672,7 +1111,7 @@ export default function Loupe() {
             </button>
           )}
           <button onClick={() => setShowSettings(true)} style={ghostBtnStyle}>
-            <Settings size={14} /> {providerInfo.label}
+            <Settings size={14} /> {provider === 'custom' && customProviderName ? customProviderName : providerInfo.label}
           </button>
         </div>
       </div>
@@ -681,8 +1120,12 @@ export default function Loupe() {
         <SettingsModal
           provider={provider} baseUrl={baseUrl} model={model} apiKey={apiKey}
           huntContradictions={huntContradictions} providerInfo={providerInfo}
+          embedModel={embedModel} nliModel={nliModel} retrievalMethod={retrievalMethod}
+          customProviderName={customProviderName}
           onProvider={handleProvider} onBaseUrl={handleBaseUrl} onModel={handleModel}
           onApiKey={handleApiKey} onToggleHunt={toggleHunt}
+          onEmbedModel={handleEmbedModel} onNliModel={handleNliModel} onRetrieval={handleRetrieval}
+          onCustomProviderName={handleCustomProviderName}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -731,7 +1174,9 @@ export default function Loupe() {
                       <div style={{ flex: 1, overflow: 'hidden' }}>
                         <div style={{ fontSize: 13.5, fontWeight: 600, color: C.teal, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{paper.name}</div>
                         <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
-                          {paper.type === 'pdf' ? 'PDF document · single-pass (no chunking)' : `${(paper.content || '').split(' ').filter(Boolean).length} words`}
+                          {paper.type === 'pdf'
+                            ? (singlePassPdf ? 'PDF document · single-pass (native, no chunking)' : 'PDF document · read as extracted text')
+                            : `${(paper.content || '').split(' ').filter(Boolean).length} words`}
                         </div>
                       </div>
                       <button onClick={() => { setPaper(null); setPaperTxt(''); }} style={{ background: 'none', border: 'none', color: C.red, cursor: 'pointer' }}>
@@ -751,6 +1196,11 @@ export default function Loupe() {
                 {isChunkable && (
                   <div style={{ fontSize: 11.5, color: C.faint, marginTop: 8 }}>
                     ~{estChunks} chunk{estChunks !== 1 ? 's' : ''} · ~{estCalls} API call{estCalls !== 1 ? 's' : ''} to check every cited claim
+                  </div>
+                )}
+                {providerInfo.kind === 'browser' && browserClaimEstimate > 0 && (
+                  <div style={{ fontSize: 11.5, color: C.faint, marginTop: 8 }}>
+                    ~{browserClaimEstimate} cited claim{browserClaimEstimate !== 1 ? 's' : ''} detected — no API calls, runs entirely on-device
                   </div>
                 )}
               </div>
@@ -810,6 +1260,18 @@ export default function Loupe() {
             <div style={{ width: 52, height: 52, borderRadius: '50%', border: `3px solid ${C.border}`, borderTop: `3px solid ${C.teal}`, animation: 'spin 1s linear infinite' }} />
             <div style={{ fontSize: 14.5, color: C.muted }}>{runStatus || 'Reading sources and checking claims…'}</div>
             {liveChunk && <div style={{ width: 280 }}><ProgressBar current={liveChunk.current} total={liveChunk.total} /></div>}
+            {modelProgress && Object.keys(modelProgress).length > 0 && (
+              <div style={{ width: 280, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {Object.entries(modelProgress).map(([key, p]) => (
+                  <div key={key}>
+                    <div style={{ fontSize: 11.5, color: C.faint, marginBottom: 4 }}>
+                      {key === 'embedding' ? 'Embedding model' : 'NLI model'} — {typeof p.progress === 'number' ? `${Math.round(p.progress)}%` : (p.status || 'loading')}
+                    </div>
+                    <ProgressBar current={typeof p.progress === 'number' ? p.progress : 0} total={100} />
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

@@ -32,19 +32,58 @@ Loupe has no backend and no account system. Everything — reading your paper, r
 
 ## Providers
 
-Pick any of these, or point it at a local model server:
+The settings panel presents these in three tiers, in order:
 
-| Provider | Notes |
+1. **Local — no API key, no setup** *(recommended, default)* — runs entirely in your browser, nothing to install, nothing to pay for, see below.
+2. **Local AI (Ollama, LM Studio, vLLM, …)** — any OpenAI-compatible server running on your own machine. LLM-quality reasoning, still no API key, but you need that server running.
+3. **Bring your own API key**, tucked behind a toggle since it's a bigger ask than one click. Instead of a dropdown, there's one text box: type a name (`claude`, `deepseek`, `openrouter`, …) and matching providers show up as clickable suggestions — click one and the base URL, model, and everything else fill in for you. Recognized out of the box:
+
+   | Provider | Notes |
+   |---|---|
+   | Anthropic (Claude) | Reads PDF bytes natively |
+   | OpenAI | |
+   | Google (Gemini) | via Google's OpenAI-compatible endpoint — has a free tier |
+   | Groq | has a free tier |
+   | OpenRouter | |
+   | Hugging Face | via the Hugging Face Inference Router |
+   | DeepSeek | |
+
+   Type something we don't recognize and it just becomes a custom entry — fill in the base URL, model, and key yourself. If someone has an API key for a provider we don't know by name, they almost certainly know its base URL already.
+
+All of these except Anthropic speak the same OpenAI-compatible `chat/completions` shape, so adding another one is just adding a base URL — that's also why an unrecognized custom entry defaults to that shape rather than asking which format it speaks.
+
+**PDF support**: every provider handles PDFs now, just not identically. Anthropic reads the PDF's bytes natively (best fidelity — tables, figures, layout). Every other provider — including the local-AI and bring-your-own-key ones — gets the text [`pdfjs-dist`](https://github.com/mozilla/pdf.js) extracts from the PDF client-side, same as a `.txt` upload from that point on. That's a deliberate "support it as broadly as possible without pretending it's the same fidelity everywhere" choice: a PDF with complex tables may extract messily outside Anthropic, but it isn't blocked.
+
+### Local — no API key, no setup
+
+This is the recommended default: no account, no payment, nothing to configure. It doesn't call any LLM. Instead:
+
+1. **Retrieval**: reference documents are split into sentences and indexed with [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) (classic lexical search), then an embedding model ([`bge-base-en-v1.5`](https://huggingface.co/Xenova/bge-base-en-v1.5) by default) reranks the top candidates semantically.
+2. **Claim detection**: sentences in your paper are flagged as claims by simple rules — carries a citation, contains a number/statistic, uses a causal verb ("shows", "demonstrates", "found that"), or a comparative ("higher than", "increased").
+3. **Reasoning**: for each cited claim, an NLI (natural-language-inference) model ([`nli-deberta-v3-base`](https://huggingface.co/Xenova/nli-deberta-v3-base) by default) checks whether each of the top-5 retrieved reference sentences actually supports, contradicts, or is unrelated to the claim.
+
+Both models (~80MB + ~350MB by default) download once from the Hugging Face Hub the first time you use this option and are cached by the browser — after that, verification runs fully offline. Everything happens inside a Web Worker so the page stays responsive during inference. Model choice, and the (advanced, collapsed by default) retrieval-method setting, live in the settings panel.
+
+#### Model quality — measured, not guessed
+
+`bench/run.mjs` runs a small hand-built test set against every model option using the exact same classification code the app runs in production (`src/lib/nli.js`), and prints real accuracy numbers. Run it yourself with `npm run bench`. Current results — 6 retrieval test cases, 14 reasoning test cases, so treat this as real signal from a small sample, not a rigorous benchmark:
+
+| Embedding model | Retrieval accuracy |
 |---|---|
-| Anthropic (Claude) | Only provider with native PDF support — Claude reads PDF bytes directly |
-| OpenAI | |
-| Google (Gemini) | via Google's OpenAI-compatible endpoint |
-| Groq | |
-| OpenRouter | |
-| Hugging Face | via the Hugging Face Inference Router |
-| Local / custom | any OpenAI-compatible server — Ollama, LM Studio, vLLM, etc. |
+| `all-MiniLM-L6-v2` (default) | 100% — smallest and fastest of the two |
+| `bge-base-en-v1.5` | 100% — larger, purpose-built for retrieval; an alternative if MiniLM ever misses something |
 
-All of these except Anthropic speak the same OpenAI-compatible `chat/completions` shape, so adding another one is just adding a base URL. PDF papers and PDF sources currently require Anthropic, since Claude parses PDF bytes natively — everyone else needs `.txt` or `.docx`, since generic chat-completions endpoints don't take raw documents.
+`bge-small-en-v1.5` was tested and dropped: 83%, worse than both options above while also being larger than MiniLM — no axis it won on.
+
+| NLI model | Reasoning accuracy |
+|---|---|
+| `nli-deberta-v3-base` (default) | 79%, ~350MB |
+| `deberta-v3-base-zeroshot-v2.0` | 86% — the most accurate option, but ~740MB. Not the default: its source repo only publishes an unquantized ONNX export (no `model_quantized.onnx` like the other models here), so it needs `dtype: 'fp32'` forced explicitly in `NLI_MODELS` or the browser runtime 404s trying to fetch a quantized file that doesn't exist — and even fixed, it's over twice the download for 7 more points, which isn't the right trade-off as a default |
+| `mobilebert-uncased-mnli` | 50%, ~100MB — but missed *every* contradiction case in testing (called them "unrelated"); fine for a quick supported/unsupported read, not for the contradiction-hunting feature |
+
+`nli-deberta-v3-small` (36%) was also tested and dropped — performed close to chance on anything beyond a direct match. Whenever a new model option is added, re-run the benchmark **and check which ONNX variants actually exist in that repo** before wiring it in — never hand-write a percentage or assume a quantized file exists.
+
+**Be honest about the trade-off**: even with the best-measured models, this is meaningfully more limited than an LLM-based provider. Claim detection is rule-based, not semantic understanding, so it will miss claims an LLM would catch and occasionally flag ones that aren't real claims. NLI models are also known to be less reliable than LLMs at numeric reasoning (e.g. distinguishing "a 40% reduction" from "a 45% reduction") and multi-sentence context. The larger default models and wider evidence pool (top-5, not top-3) push it as close to LLM-level judgment as this approach reasonably gets — but it's a different technique, not a compressed copy of an LLM, and it won't always agree with what an LLM-based provider would say about the same claim.
 
 ## Running it
 
@@ -81,9 +120,13 @@ This requires the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites
 3. **Contradiction pass.** A second, separately-framed call asks only "what here contradicts the paper?" — deliberately not mixed into the support-checking call, since a single prompt biases toward the framing it's given and under-searches for the other thing.
 4. **Resumability.** Progress is saved to `localStorage` after every chunk. If a run stops partway (you'll see exactly which chunk it stopped at and why), click **Resume** to continue, or **Download** the progress file to move it to another browser/machine and pick up there via **Load progress file**.
 
+## Works with small and local models, not just frontier ones
+
+Loupe isn't built assuming you're paying for a large hosted model. Smaller and local models (a 3B–7B model through Ollama, LM Studio, etc.) are far more prone to two specific failures under a long, rule-heavy prompt: dropping the connection under memory pressure, and not strictly following a "respond with only JSON" instruction. Rather than surfacing those as a crash, Loupe retries automatically (up to 3 attempts, with a short backoff) on both connection failures and malformed JSON, and pulls the JSON object out of a response even if the model added commentary around it. This trades a bit of time for reliability on purpose — the response quality target doesn't move depending on which model you bring; the model choice is entirely up to you.
+
 ## Cost note
 
-Chunking means more API calls than a single-shot summary would — each chunk resends your source documents so accurate checking can happen against the full context. On Anthropic, the source documents are marked for prompt caching to keep that from multiplying token cost by the chunk count; other providers don't get that optimization here yet. The app shows an estimated chunk/call count before you run.
+Chunking means more API calls than a single-shot summary would — each chunk resends your source documents so accurate checking can happen against the full context. On Anthropic, the source documents are marked for prompt caching to keep that from multiplying token cost by the chunk count; other providers don't get that optimization here yet. The app shows an estimated chunk/call count before you run. Automatic retries (above) can add a couple more calls on top of that estimate when a response needs a second try.
 
 ## Frequently asked questions
 

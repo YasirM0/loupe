@@ -28,11 +28,14 @@
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "bench": "node bench/run.mjs"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "lucide-react": "^1.33.0",
     "mammoth": "^1.12.1",
+    "pdfjs-dist": "^6.2.108",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
