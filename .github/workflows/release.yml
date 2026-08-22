@@ -10,6 +10,14 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# No explicit permissions block meant this ran with the repo's default
+# GITHUB_TOKEN permissions (read-only unless changed in Settings → Actions),
+# which fails release creation with "Resource not accessible by integration"
+# regardless of how clean the build itself is. Declaring it here doesn't
+# depend on that repo-wide setting.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
