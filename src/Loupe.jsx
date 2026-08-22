@@ -1,9 +1,10 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { Upload, BookOpen, FileText, Trash2, CheckCircle,
          AlertCircle, XCircle, Loader, Copy, Settings, X, ArrowLeft,
          Download, AlertTriangle, ShieldCheck, ExternalLink, ChevronDown, ChevronUp } from "lucide-react";
 import { extractPdfText, extractDocxText } from "./lib/extractText.js";
 import { chunkReferenceIntoSentences, extractClaims } from "./lib/textProcessing.js";
+import { BM25Index } from "./lib/bm25.js";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -76,18 +77,33 @@ function matchApiProviders(input) {
 // sample, not a rigorous benchmark, but it's real signal instead of a guess.
 // bge-small-en-v1.5 was dropped: it scored 83% on our test, worse than both
 // options below, while also being larger than MiniLM — no axis it wins on.
+// A wider sweep of MiniLM/E5/BGE-small-class candidates (2026-08-22, see
+// bench/run.mjs) found 3 more that tied the top score, included below so
+// they can be compared on real documents rather than just this 6-case set.
+//
+// `size` is the actual download size of the quantized ONNX file each model
+// loads by default (measured via HEAD request), not the larger fp32
+// checkpoint size that was previously (incorrectly) shown here.
+//
+// `pooling`/`queryPrefix`/`passagePrefix` encode each model's documented
+// embedding convention — asymmetric models (e5, arctic-embed) score much
+// worse if queries and reference passages aren't prefixed as their model
+// card specifies; the worker applies these automatically per model.
 const EMBED_MODELS = [
-  { id: 'Xenova/all-MiniLM-L6-v2',  label: 'all-MiniLM-L6-v2',  size: '~80MB',  quality: 100, desc: 'Default — 100% on our retrieval test (6 cases), smallest and fastest of the tied options' },
-  { id: 'Xenova/bge-base-en-v1.5',  label: 'bge-base-en-v1.5',  size: '~210MB', quality: 100, desc: 'Also 100% on our test — larger, built specifically for retrieval; worth trying if MiniLM misses something on your paper' },
+  { id: 'Xenova/all-MiniLM-L6-v2',  label: 'all-MiniLM-L6-v2',  size: '~22MB',  quality: 100, desc: 'Default — 100% on our retrieval test (6 cases), smallest and fastest of the tied options' },
+  { id: 'Xenova/bge-base-en-v1.5',  label: 'bge-base-en-v1.5',  size: '~105MB', quality: 100, desc: 'Also 100% on our test — larger, built specifically for retrieval; worth trying if MiniLM misses something on your paper' },
+  { id: 'Xenova/e5-small-v2', label: 'e5-small-v2', size: '~32MB', quality: 100, queryPrefix: 'query: ', passagePrefix: 'passage: ', desc: '100% on our test — smaller than bge-base, similar speed to the other new options' },
+  { id: 'Xenova/all-MiniLM-L12-v2', label: 'all-MiniLM-L12-v2', size: '~32MB', quality: 100, desc: '100% on our test — MiniLM with more layers than the default L6 version, so slower per embedding for the same architecture family' },
+  { id: 'Snowflake/snowflake-arctic-embed-s', label: 'snowflake-arctic-embed-s', size: '~32MB', quality: 100, pooling: 'cls', queryPrefix: 'Represent this sentence for searching relevant passages: ', desc: '100% on our test — purpose-built for retrieval, uses CLS pooling instead of mean' },
 ];
 const NLI_MODELS = [
-  { id: 'Xenova/nli-deberta-v3-base', label: 'nli-deberta-v3-base', size: '~350MB', quality: 79, desc: 'Default — 79% on our reasoning test (14 cases), reasonable download size' },
+  { id: 'Xenova/nli-deberta-v3-base', label: 'nli-deberta-v3-base', size: '~233MB', quality: 79, desc: 'Default — 79% on our reasoning test (14 cases), reasonable download size' },
   // dtype: 'fp32' is required here — unlike the model above, this repo only
   // publishes the raw fp32 ONNX export, no quantized variants. Without
   // forcing it, the library defaults to requesting a quantized file that
   // doesn't exist in this repo and the load 404s.
-  { id: 'MoritzLaurer/deberta-v3-base-zeroshot-v2.0', label: 'deberta-v3-base-zeroshot-v2.0', size: '~740MB', dtype: 'fp32', quality: 86, desc: '86% on our test, the most accurate option — but a much bigger download (no quantized version of this one exists), so it is not the default' },
-  { id: 'Xenova/mobilebert-uncased-mnli', label: 'mobilebert-uncased-mnli', size: '~100MB', quality: 50, desc: '50% on our test, much smaller — but it missed every single contradiction case in testing (called them "unrelated" instead). Fine for a quick supported/unsupported check, unreliable for catching errors — the retry/contradiction-hunting feature depends on the model actually recognizing a contradiction' },
+  { id: 'MoritzLaurer/deberta-v3-base-zeroshot-v2.0', label: 'deberta-v3-base-zeroshot-v2.0', size: '~704MB', dtype: 'fp32', quality: 86, desc: '86% on our test, the most accurate option — but a much bigger download (no quantized version of this one exists), so it is not the default' },
+  { id: 'Xenova/mobilebert-uncased-mnli', label: 'mobilebert-uncased-mnli', size: '~26MB', quality: 50, desc: '50% on our test, much smaller — but it missed every single contradiction case in testing (called them "unrelated" instead). Fine for a quick supported/unsupported check, unreliable for catching errors — the retry/contradiction-hunting feature depends on the model actually recognizing a contradiction' },
 ];
 const RETRIEVAL_METHODS = [
   { id: 'rerank',     label: 'BM25 then rerank', desc: 'Default — BM25 top-30, embeddings rerank to top-5' },
@@ -96,6 +112,11 @@ const RETRIEVAL_METHODS = [
 ];
 
 const CHUNK_WORDS = 900;
+// How many chunks' worth of requests run concurrently. Higher is faster
+// wall-clock but more likely to trip a provider's rate limit (which the
+// existing 429 retry logic absorbs, just with added latency) — 3 is a
+// reasonable middle ground for typical API tiers, including free ones.
+const CHUNK_CONCURRENCY = 3;
 
 // ── File reading ──────────────────────────────────────────────────────────────
 // `.text` is always the real extracted text (used by the local browser
@@ -315,35 +336,80 @@ function buildFinalResult(cited, uncited, contradictions) {
   return { citedClaims: cited, uncitedClaims: uncited, contradictions, ...summarize(cited, uncited, contradictions) };
 }
 
+// A raw Date.now() epoch (e.g. loupe-report-1787354121516.txt) is unreadable
+// and gives no sense of when the file was made — this reads at a glance and
+// still won't collide within the same minute in normal use.
+function filenameTimestamp() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+// Strips the extension and anything not safe/pleasant in a filename, so a
+// paper named "Beyond remittances: knowledge transfer (draft v2).docx"
+// becomes a readable "Beyond-remittances-knowledge-transfer-draft-v2".
+function slugifyFilename(name) {
+  return name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50);
+}
+
 // ── Sub-components ────────────────────────────────────────────────────────────
-function DropZone({ label, sub, multi, onFile, onFiles, flush }) {
+function DropZone({ label, sub, multi, onFile, onFiles, flush, busy, compact }) {
   const ref = useRef();
-  const onChange = async e => {
-    const files = [...e.target.files];
+  const [isDragging, setIsDragging] = useState(false);
+  const takeFiles = async files => {
     if (!files.length) return;
     if (multi && onFiles) await onFiles(files);
     else if (onFile) await onFile(files[0]);
+  };
+  const onChange = async e => {
+    await takeFiles([...e.target.files]);
     e.target.value = '';
+  };
+  const onDrop = async e => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (busy) return;
+    await takeFiles([...e.dataTransfer.files]);
   };
   return (
     <div
-      onClick={() => ref.current?.click()}
-      onMouseEnter={e => e.currentTarget.style.background = C.panel}
-      onMouseLeave={e => e.currentTarget.style.background = flush ? 'transparent' : C.card}
+      onClick={() => { if (!busy) ref.current?.click(); }}
+      onMouseEnter={e => { if (!isDragging && !busy) e.currentTarget.style.background = C.panel; }}
+      onMouseLeave={e => { if (!isDragging) e.currentTarget.style.background = flush ? 'transparent' : C.card; }}
+      onDragOver={e => { if (!busy) { e.preventDefault(); setIsDragging(true); } }}
+      onDragLeave={() => setIsDragging(false)}
+      onDrop={onDrop}
       style={{
-        border: flush ? 'none' : `1px solid ${C.border}`, borderRadius: flush ? 0 : 10,
-        background: flush ? 'transparent' : C.card,
-        padding: '32px 20px', textAlign: 'center', cursor: 'pointer', transition: 'background .15s',
+        border: isDragging ? `1px dashed ${C.teal}` : (flush ? 'none' : `1px solid ${C.border}`),
+        borderRadius: flush ? 0 : 10,
+        background: isDragging ? C.tealBg : (flush ? 'transparent' : C.card),
+        padding: compact ? '16px 20px' : '44px 20px', textAlign: 'center',
+        cursor: busy ? 'default' : 'pointer', transition: 'background .15s, border-color .15s',
+        opacity: busy ? 0.7 : 1,
       }}
     >
-      <div style={{
-        width: 40, height: 40, borderRadius: '50%', background: C.tealBg, border: `1px solid ${C.teal}33`,
-        display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 14px',
-      }}>
-        <Upload size={18} color={C.teal} />
-      </div>
-      <div style={{ fontSize: 13.5, color: C.text }}>{label}</div>
-      {sub && <div style={{ fontSize: 11.5, color: C.faint, marginTop: 5 }}>{sub}</div>}
+      {compact ? (
+        busy
+          ? <div style={{ fontSize: 12.5, color: C.muted, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+              <span style={{ width: 13, height: 13, borderRadius: '50%', border: `2px solid ${C.border}`, borderTop: `2px solid ${C.teal}`, animation: 'spin 0.8s linear infinite', display: 'inline-block' }} />
+              Reading file{multi ? 's' : ''}…
+            </div>
+          : <span style={{ fontSize: 12.5, color: C.muted }}>+ {label}</span>
+      ) : (
+        <>
+          <div style={{
+            width: 64, height: 64, borderRadius: '50%', background: C.tealBg, border: `1px solid ${C.teal}33`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px',
+          }}>
+            {busy
+              ? <span style={{ width: 24, height: 24, borderRadius: '50%', border: `2.5px solid ${C.teal}33`, borderTop: `2.5px solid ${C.teal}`, animation: 'spin 0.8s linear infinite', display: 'inline-block' }} />
+              : <Upload size={28} color={C.teal} />}
+          </div>
+          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600 }}>{busy ? `Reading file${multi ? 's' : ''}…` : label}</div>
+          {!busy && sub && <div style={{ fontSize: 11.5, color: C.muted, marginTop: 5 }}>{sub}</div>}
+          {!busy && <div style={{ fontSize: 11.5, color: C.muted, marginTop: 5 }}>or drag and drop</div>}
+        </>
+      )}
       <input ref={ref} type="file" accept=".txt,.docx,.pdf" multiple={!!multi} onChange={onChange} style={{ display: 'none' }} />
     </div>
   );
@@ -421,7 +487,7 @@ function ClaimCard({ claim }) {
           )}
           <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55 }}>{claim.explanation}</div>
           {claim.source && claim.source !== 'none' && (
-            <div style={{ fontSize: 12, color: C.teal, marginTop: 8 }}>→ {claim.source}</div>
+            <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>→ {claim.source}</div>
           )}
         </div>
       </div>
@@ -429,22 +495,74 @@ function ClaimCard({ claim }) {
   );
 }
 
-function UncitedClaimCard({ claim }) {
+function UncitedClaimCard({ claim, suggestion, review, onMine, onHelp }) {
   return (
-    <div style={{ background: C.card, border: `1px dashed ${C.border}`, borderRadius: 10, padding: '20px 24px', marginBottom: 14 }}>
+    <div style={{
+      background: C.card, border: `1px dashed ${review === 'own' ? C.faint : C.border}`, borderRadius: 10,
+      padding: '20px 24px', marginBottom: 14, opacity: review === 'own' ? 0.6 : 1,
+    }}>
       <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
         <span style={{
           background: 'transparent', color: C.muted, border: `1px solid ${C.border}`, fontSize: 10.5, fontWeight: 700,
           padding: '4px 9px', borderRadius: 5, letterSpacing: '0.06em', textTransform: 'uppercase',
           whiteSpace: 'nowrap', flexShrink: 0, marginTop: 2,
         }}>
-          No citation
+          {review === 'own' ? 'Marked as yours' : 'No citation'}
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 15, color: C.text, lineHeight: 1.6, marginBottom: 6 }}>{claim.claim}</div>
-          {claim.note && <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55 }}>{claim.note}</div>}
+          {claim.note && <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 10 }}>{claim.note}</div>}
+
+          {review !== 'own' && (
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button onClick={onMine} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.muted, cursor: 'pointer', fontSize: 11.5, padding: '6px 12px' }}>
+                This is mine
+              </button>
+              {suggestion && (
+                <button onClick={onHelp} style={{ background: 'none', border: `1px solid ${C.teal}55`, borderRadius: 7, color: C.teal, cursor: 'pointer', fontSize: 11.5, padding: '6px 12px' }}>
+                  Help me cite this
+                </button>
+              )}
+            </div>
+          )}
+
+          {review === 'shown' && suggestion && (
+            <div style={{ marginTop: 12, borderLeft: `2px solid ${C.faint}`, paddingLeft: 12 }}>
+              <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 5 }}>
+                Closest match in your sources — verify it yourself before citing
+              </div>
+              <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, fontStyle: 'italic' }}>"{suggestion.text}"</div>
+              <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>→ {suggestion.source}</div>
+            </div>
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function FilterTabs({ result, active, onChange }) {
+  const tabs = [
+    { key: 'ALL', label: 'All Claims', count: result.citedClaims.length + result.uncitedClaims.length },
+    { key: 'SUPPORTED', label: STATUS.SUPPORTED.label, count: result.counts.SUPPORTED },
+    { key: 'PARTIAL', label: STATUS.PARTIAL.label, count: result.counts.PARTIAL },
+    { key: 'UNSUPPORTED', label: STATUS.UNSUPPORTED.label, count: result.counts.UNSUPPORTED },
+    { key: 'CONTRADICTED', label: STATUS.CONTRADICTED.label, count: result.counts.CONTRADICTED },
+    { key: 'UNCITED', label: 'Uncited', count: result.uncitedClaims.length },
+  ].filter(t => t.key === 'ALL' || t.count > 0);
+
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 28 }}>
+      {tabs.map(t => (
+        <button key={t.key} onClick={() => onChange(t.key)} style={{
+          background: active === t.key ? C.teal : 'none',
+          color: active === t.key ? '#070C18' : C.muted,
+          border: `1px solid ${active === t.key ? C.teal : C.border}`,
+          borderRadius: 20, padding: '7px 16px', fontSize: 12.5, fontWeight: active === t.key ? 700 : 500, cursor: 'pointer',
+        }}>
+          {t.label} ({t.count})
+        </button>
+      ))}
     </div>
   );
 }
@@ -473,6 +591,44 @@ function ProgressBar({ current, total }) {
   );
 }
 
+// Live stats while a run is in progress — fed by `liveClaims`, which grows
+// as real results land (per-claim for the browser pipeline, per-batch for
+// chunked LLM runs; stays empty for the single-call whole-document path,
+// which has no intermediate signal to show). Reuses `summarize()` so the
+// numbers here are computed the exact same way as the final result.
+function LiveProgressPanel({ liveClaims }) {
+  if (!liveClaims.length) return null;
+  const { counts } = summarize(liveClaims, [], []);
+  const issues = counts.UNSUPPORTED + counts.CONTRADICTED;
+  const latest = liveClaims[liveClaims.length - 1];
+  const stats = [
+    { label: 'Checked', value: liveClaims.length, col: C.text },
+    { label: 'Supported', value: counts.SUPPORTED, col: C.green },
+    { label: 'Partial', value: counts.PARTIAL, col: C.amber },
+    { label: 'Issues', value: issues, col: C.red },
+  ];
+  return (
+    <div style={{ width: '100%', maxWidth: 420, display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+        {stats.map(s => (
+          <div key={s.label} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: '12px 6px', textAlign: 'center' }}>
+            <div style={{ fontSize: 20, fontWeight: 800, color: s.col, lineHeight: 1 }}>{s.value}</div>
+            <div style={{ fontSize: 10.5, color: C.muted, marginTop: 5 }}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+      {latest && (
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: '12px 16px' }}>
+          <div style={{ fontSize: 10.5, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Latest checked</div>
+          <div style={{ fontSize: 12.5, color: C.muted, lineHeight: 1.5, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+            {latest.claim}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Footer() {
   return (
     <footer style={{ borderTop: `1px solid ${C.border}`, padding: '32px 24px 44px', textAlign: 'center' }}>
@@ -482,7 +638,7 @@ function Footer() {
         you choose, and we never see or keep a copy of it. You're responsible for that provider's own usage,
         costs, and terms.
       </div>
-      <div style={{ fontSize: 11.5, color: C.faint, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+      <div style={{ fontSize: 11.5, color: C.muted, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
         <span>Built by</span>
         <a href="https://github.com/YasirM0" target="_blank" rel="noopener noreferrer" style={{ color: C.teal, textDecoration: 'none' }}>
           Yasir Mohammed
@@ -571,7 +727,7 @@ function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, c
           </div>
         )}
         {!resolved && nameInput.trim() && !suggestions.length && (
-          <div style={{ fontSize: 11, color: C.faint, marginTop: 6, lineHeight: 1.5 }}>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
             Not one we recognize — that's fine, click away and fill in the base URL and model yourself below.
           </div>
         )}
@@ -597,7 +753,7 @@ function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, c
             <input type="checkbox" checked={huntContradictions} onChange={onToggleHunt} />
             Hunt for contradictions (separate pass, ~2× calls)
           </label>
-          <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.65 }}>
+          <div style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.65 }}>
             Stored only in this browser (localStorage), sent only to the base URL above.
           </div>
         </>
@@ -625,7 +781,7 @@ function LocalAiFields({ baseUrl, model, apiKey, huntContradictions, onBaseUrl, 
         <input type="checkbox" checked={huntContradictions} onChange={onToggleHunt} />
         Hunt for contradictions (separate pass, ~2× calls)
       </label>
-      <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.65 }}>
+      <div style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.65 }}>
         Stored only in this browser (localStorage), sent only to the base URL above.
       </div>
     </>
@@ -693,7 +849,7 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
             />
           ) : provider === 'browser' ? (
             <>
-              <div style={{ fontSize: 11.5, color: C.faint, lineHeight: 1.65, background: C.tealBg, border: `1px solid ${C.teal}22`, borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.65, background: C.tealBg, border: `1px solid ${C.teal}22`, borderRadius: 8, padding: '10px 12px' }}>
                 No API key, no account, no server. Two models download once to this browser and are cached — after that it works offline. Quality is more limited than an LLM-based provider (rule-based claim detection, embedding + NLI reasoning instead of full language understanding), but there's nothing to pay for and nothing to configure. The defaults are already the best-measured options below (real test results, not a guess) — most people don't need to open "Advanced."
               </div>
               <button onClick={() => setShowAdvanced(v => !v)} style={{
@@ -709,21 +865,21 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
                     <select value={embedModel} onChange={e => onEmbedModel(e.target.value)} style={inputStyle}>
                       {EMBED_MODELS.map(m => <option key={m.id} value={m.id}>{m.label} — {m.size}{m.quality != null ? ` — ${m.quality}% on our test set` : ''}</option>)}
                     </select>
-                    <div style={{ fontSize: 11, color: C.faint, marginTop: 4 }}>{EMBED_MODELS.find(m => m.id === embedModel)?.desc}</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{EMBED_MODELS.find(m => m.id === embedModel)?.desc}</div>
                   </div>
                   <div>
                     <div style={fieldLabelStyle}>NLI model (reasoning)</div>
                     <select value={nliModel} onChange={e => onNliModel(e.target.value)} style={inputStyle}>
                       {NLI_MODELS.map(m => <option key={m.id} value={m.id}>{m.label} — {m.size}{m.quality != null ? ` — ${m.quality}% on our test set` : ''}</option>)}
                     </select>
-                    <div style={{ fontSize: 11, color: C.faint, marginTop: 4 }}>{NLI_MODELS.find(m => m.id === nliModel)?.desc}</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{NLI_MODELS.find(m => m.id === nliModel)?.desc}</div>
                   </div>
                   <div>
                     <div style={fieldLabelStyle}>Retrieval method</div>
                     <select value={retrievalMethod} onChange={e => onRetrieval(e.target.value)} style={inputStyle}>
                       {RETRIEVAL_METHODS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
                     </select>
-                    <div style={{ fontSize: 11, color: C.faint, marginTop: 4 }}>{RETRIEVAL_METHODS.find(m => m.id === retrievalMethod)?.desc}</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{RETRIEVAL_METHODS.find(m => m.id === retrievalMethod)?.desc}</div>
                   </div>
                 </>
               )}
@@ -762,12 +918,24 @@ export default function Loupe() {
 
   const [paper,    setPaper]    = useState(null);
   const [paperTxt, setPaperTxt] = useState('');
+  const [pasteMode, setPasteMode] = useState(false);
   const [refs,     setRefs]     = useState([]);
+  const [uploadingPaper, setUploadingPaper] = useState(false);
+  const [uploadingRefs,  setUploadingRefs]  = useState(false); // PDF text extraction in particular can take real seconds — this is what tells the user it's working, not frozen
+  // What "New verification" cleared, kept only so it can be restored —
+  // covers reusing the same paper against different sources or vice versa,
+  // without forcing a full re-upload of both sides every time.
+  const [lastPaper,    setLastPaper]    = useState(null);
+  const [lastPaperTxt, setLastPaperTxt] = useState('');
+  const [lastRefs,     setLastRefs]     = useState([]);
   const [result,   setResult]   = useState(null);
   const [loading,  setLoading]  = useState(false);
   const [runStatus, setRunStatus] = useState('');
   const [liveChunk, setLiveChunk] = useState(null); // { current, total } for the active run only
   const [modelProgress, setModelProgress] = useState(null); // browser-pipeline model download progress
+  const [liveClaims, setLiveClaims] = useState([]); // cited claims resolved so far in the active run — powers the live stats/activity panel
+  const [activeFilter, setActiveFilter] = useState('ALL'); // results-screen filter tab
+  const [uncitedReview, setUncitedReview] = useState({}); // { [uncitedClaimIndex]: 'own' | 'shown' } — per-claim "help me cite" state
   const [err,      setErr]      = useState(null);
   const [copied,   setCopied]   = useState(false);
   const [progress, setProgress] = useState(null); // paused/resumable snapshot, persisted
@@ -814,12 +982,16 @@ export default function Loupe() {
   };
 
   const handlePaper = async file => {
+    setUploadingPaper(true);
     try { const d = await readFile(file); setPaper(d); setPaperTxt(d.content || ''); }
     catch (e) { setErr('Could not read paper: ' + e.message); }
+    finally { setUploadingPaper(false); }
   };
   const handleRefs = async files => {
+    setUploadingRefs(true);
     try { const loaded = await Promise.all(files.map(readFile)); setRefs(prev => [...prev, ...loaded]); }
     catch (e) { setErr('Could not read reference: ' + e.message); }
+    finally { setUploadingRefs(false); }
   };
 
   const saveProgress = snap => {
@@ -836,7 +1008,7 @@ export default function Loupe() {
     const blob = new Blob([JSON.stringify(progress, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = `loupe-progress-${Date.now()}.json`;
+    a.href = url; a.download = `loupe-progress-${filenameTimestamp()}.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -876,41 +1048,66 @@ export default function Loupe() {
 
     const refParts = buildRefParts(refs, providerInfo.kind);
     setLoading(true); setErr(null); setResult(null);
+    setActiveFilter('ALL'); setUncitedReview({});
     setLiveChunk({ current: i, total: chunks.length });
+    setLiveClaims(cited);
 
-    for (; i < chunks.length; i++) {
-      setRunStatus(`Checking chunk ${i + 1} of ${chunks.length}…`);
-      const paperParts = [{ type: 'text', text: `[PAPER EXCERPT ${i + 1}/${chunks.length}]\n${chunks[i]}` }];
-      const retryStatus = (attempt, max) =>
-        setRunStatus(`Checking chunk ${i + 1} of ${chunks.length} — response wasn't usable, retrying (${attempt}/${max - 1})…`);
+    // Chunks within a batch run concurrently (independent requests, no
+    // ordering dependency), and each chunk's own claim-check +
+    // contradiction-hunt calls also run concurrently rather than back to
+    // back. Progress still only saves at whole-batch boundaries, so
+    // chunkIndex stays a simple linear pointer — resume logic is unchanged,
+    // it just advances in bigger steps. If any request in a batch fails
+    // (after its own internal retries), the whole batch is discarded and
+    // resume restarts from the batch's first chunk — a small amount of
+    // re-work, traded for not having to track partial-batch completion.
+    while (i < chunks.length) {
+      const batchEnd = Math.min(i + CHUNK_CONCURRENCY, chunks.length);
+      const batchLabel = batchEnd - i > 1 ? `chunks ${i + 1}–${batchEnd}` : `chunk ${i + 1}`;
+      setRunStatus(`Checking ${batchLabel} of ${chunks.length}…`);
+
+      let batchResults;
       try {
-        const verdict = await callLLM({
-          kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
-          parts: [...refParts, ...paperParts], instructions: claimInstructions({ whole: false }),
-          onRetry: retryStatus,
-        });
-        cited = cited.concat(verdict.citedClaims || []);
-        uncited = uncited.concat(verdict.uncitedClaims || []);
-
-        if (huntContradictions) {
-          setRunStatus(`Checking chunk ${i + 1} of ${chunks.length} for contradictions…`);
-          const cv = await callLLM({
-            kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
-            parts: [...refParts, ...paperParts], instructions: CONTRADICTION_INSTRUCTIONS,
-            onRetry: retryStatus,
-          });
-          contradictions = contradictions.concat(cv.contradictions || []);
-        }
+        batchResults = await Promise.all(
+          Array.from({ length: batchEnd - i }, (_, k) => i + k).map(async idx => {
+            const paperParts = [{ type: 'text', text: `[PAPER EXCERPT ${idx + 1}/${chunks.length}]\n${chunks[idx]}` }];
+            const retryStatus = (attempt, max) =>
+              setRunStatus(`Checking ${batchLabel} of ${chunks.length} — a response wasn't usable, retrying (${attempt}/${max - 1})…`);
+            const claimCall = callLLM({
+              kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
+              parts: [...refParts, ...paperParts], instructions: claimInstructions({ whole: false }),
+              onRetry: retryStatus,
+            });
+            const contraCall = huntContradictions
+              ? callLLM({
+                  kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
+                  parts: [...refParts, ...paperParts], instructions: CONTRADICTION_INSTRUCTIONS,
+                  onRetry: retryStatus,
+                })
+              : Promise.resolve({ contradictions: [] });
+            const [verdict, cv] = await Promise.all([claimCall, contraCall]);
+            return { verdict, cv };
+          })
+        );
       } catch (e) {
         const snap = { chunks, chunkIndex: i, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, paperTxt: text, refs };
         saveProgress(snap);
         setLoading(false);
         setLiveChunk(null);
-        setErr(`Stopped at chunk ${i + 1} of ${chunks.length}: ${e.message}. Progress is saved — click Resume to continue, or download it below.`);
+        setErr(`Stopped around ${batchLabel} of ${chunks.length}: ${e.message}. Progress is saved — click Resume to continue, or download it below.`);
         return;
       }
-      setLiveChunk({ current: i + 1, total: chunks.length });
-      saveProgress({ chunks, chunkIndex: i + 1, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, paperTxt: text, refs });
+
+      for (const { verdict, cv } of batchResults) {
+        cited = cited.concat(verdict.citedClaims || []);
+        uncited = uncited.concat(verdict.uncitedClaims || []);
+        contradictions = contradictions.concat(cv.contradictions || []);
+      }
+
+      i = batchEnd;
+      setLiveChunk({ current: i, total: chunks.length });
+      setLiveClaims(cited);
+      saveProgress({ chunks, chunkIndex: i, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, paperTxt: text, refs });
     }
 
     setResult(buildFinalResult(cited, uncited, contradictions));
@@ -921,29 +1118,30 @@ export default function Loupe() {
   };
 
   const runWholeDocument = async () => {
-    setLoading(true); setErr(null); setResult(null);
-    setRunStatus('Reading sources and checking claims…');
+    setLoading(true); setErr(null); setResult(null); setLiveClaims([]);
+    setActiveFilter('ALL'); setUncitedReview({});
+    setRunStatus(huntContradictions ? 'Checking claims and hunting for contradictions…' : 'Reading sources and checking claims…');
     const refParts = buildRefParts(refs, providerInfo.kind);
     const paperParts = [filePart(paper, 'PAPER', providerInfo.kind), { type: 'text', text: '[The document above is the PAPER TO VERIFY]' }];
     const retryStatus = (attempt, max) =>
-      setRunStatus(`Response wasn't usable, retrying (${attempt}/${max - 1})…`);
+      setRunStatus(`A response wasn't usable, retrying (${attempt}/${max - 1})…`);
     try {
-      const verdict = await callLLM({
+      // The claim-check and contradiction-hunt calls are independent, so
+      // they run concurrently instead of one after the other.
+      const claimCall = callLLM({
         kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
         parts: [...refParts, ...paperParts], instructions: claimInstructions({ whole: true }),
         onRetry: retryStatus,
       });
-      let contradictions = [];
-      if (huntContradictions) {
-        setRunStatus('Hunting for contradictions…');
-        const cv = await callLLM({
-          kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
-          parts: [...refParts, ...paperParts], instructions: CONTRADICTION_INSTRUCTIONS,
-          onRetry: retryStatus,
-        });
-        contradictions = cv.contradictions || [];
-      }
-      setResult(buildFinalResult(verdict.citedClaims || [], verdict.uncitedClaims || [], contradictions));
+      const contraCall = huntContradictions
+        ? callLLM({
+            kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
+            parts: [...refParts, ...paperParts], instructions: CONTRADICTION_INSTRUCTIONS,
+            onRetry: retryStatus,
+          })
+        : Promise.resolve({ contradictions: [] });
+      const [verdict, cv] = await Promise.all([claimCall, contraCall]);
+      setResult(buildFinalResult(verdict.citedClaims || [], verdict.uncitedClaims || [], cv.contradictions || []));
     } catch (e) { setErr('Verification failed: ' + e.message); }
     finally { setLoading(false); setRunStatus(''); }
   };
@@ -953,7 +1151,8 @@ export default function Loupe() {
   // support/contradiction/neutral. No network calls once the two models are
   // cached — this is the zero-API-key, zero-account path.
   const runBrowserVerification = async () => {
-    setLoading(true); setErr(null); setResult(null); setModelProgress({});
+    setLoading(true); setErr(null); setResult(null); setModelProgress({}); setLiveClaims([]);
+    setActiveFilter('ALL'); setUncitedReview({});
     const worker = getWorker();
     const paperText = paper?.text || paperTxt.trim();
     const allClaims = extractClaims(paperText);
@@ -978,7 +1177,13 @@ export default function Loupe() {
         if (msg.type === 'MODEL_PROGRESS') setModelProgress(prev => ({ ...prev, [msg.model]: msg }));
       });
       const nliDtype = NLI_MODELS.find(m => m.id === nliModel)?.dtype;
-      worker.postMessage({ type: 'LOAD_MODELS', embedModel, nliModel, retrievalMethod, nliDtype });
+      const embedCfg = EMBED_MODELS.find(m => m.id === embedModel) || {};
+      worker.postMessage({
+        type: 'LOAD_MODELS', embedModel, nliModel, retrievalMethod, nliDtype,
+        embedPooling: embedCfg.pooling || 'mean',
+        embedQueryPrefix: embedCfg.queryPrefix || '',
+        embedPassagePrefix: embedCfg.passagePrefix || '',
+      });
       await modelsReady;
       setModelProgress(null);
 
@@ -1005,6 +1210,7 @@ export default function Loupe() {
           : 'No sufficiently similar passage found in sources.';
         const entry = { claim: claim.text, citation: claim.citationText || '', status: r.status, evidence: r.evidence, source: r.source, confidence: r.confidence, explanation };
         citedClaims.push(entry);
+        setLiveClaims([...citedClaims]);
         if (r.status === 'CONTRADICTED') contradictions.push({ claim: claim.text, evidence: r.evidence, source: r.source, explanation });
       });
       worker.postMessage({ type: 'VERIFY', claims: citedCandidates, retrievalMethod });
@@ -1029,6 +1235,20 @@ export default function Loupe() {
     else runChunked();
   };
 
+  // Actually starts fresh — stashes whatever was loaded so it can be
+  // restored selectively, clears the setup, and discards any stale paused-
+  // run banner (a leftover snapshot from an earlier, unrelated run has no
+  // business surviving into a deliberately new verification).
+  const startNewVerification = () => {
+    setLastPaper(paper); setLastPaperTxt(paperTxt); setLastRefs(refs);
+    setPaper(null); setPaperTxt(''); setRefs([]);
+    setResult(null); setErr(null);
+    setActiveFilter('ALL'); setUncitedReview({});
+    clearProgress();
+  };
+  const restorePaper = () => { setPaper(lastPaper); setPaperTxt(lastPaperTxt); };
+  const restoreRefs  = () => { setRefs(lastRefs); };
+
   const resume = () => {
     if (!progress) return;
     // This paused snapshot only ever comes from the LLM-provider chunked
@@ -1045,8 +1265,8 @@ export default function Loupe() {
     runChunked(progress);
   };
 
-  const copyReport = () => {
-    if (!result) return;
+  const buildReportText = () => {
+    if (!result) return '';
     const lines = [
       `LOUPE — SOURCE VERIFICATION REPORT`, `Score: ${result.score}/100`, ``, result.summary, ``,
     ];
@@ -1061,9 +1281,25 @@ export default function Loupe() {
     ));
     lines.push('', `CLAIMS WITHOUT A CITATION`);
     lines.push(...result.uncitedClaims.map(c => `- ${c.claim}${c.note ? '\n  ' + c.note : ''}`));
-    navigator.clipboard.writeText(lines.join('\n'));
+    return lines.join('\n');
+  };
+
+  const copyReport = () => {
+    if (!result) return;
+    navigator.clipboard.writeText(buildReportText());
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const downloadReport = () => {
+    if (!result) return;
+    const blob = new Blob([buildReportText()], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const nameHint = paper?.name ? slugifyFilename(paper.name) + '-' : '';
+    a.href = url; a.download = `loupe-report-${nameHint}${filenameTimestamp()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const paperText = paperTxt.trim() || paper?.content || paper?.text || '';
@@ -1080,6 +1316,23 @@ export default function Loupe() {
     : 0;
   const estCalls  = estChunks * (huntContradictions ? 2 : 1);
   const isPaused  = progress && progress.chunkIndex < progress.chunks?.length;
+
+  // "Help me cite this" suggestions for uncited claims — plain BM25 lexical
+  // search over the user's own uploaded refs, no embedding model or NLI
+  // judgment involved (works for every provider, not just the browser
+  // pipeline, since it only needs `refs`, already in state regardless of
+  // which verification path ran). Recomputed only when the result or refs
+  // change, not on every render.
+  const uncitedSuggestions = useMemo(() => {
+    if (!result?.uncitedClaims?.length || !refs.length) return [];
+    const sentences = refs.flatMap(r => chunkReferenceIntoSentences(r.name, r.text || r.content || ''));
+    if (!sentences.length) return [];
+    const index = new BM25Index(sentences);
+    return result.uncitedClaims.map(c => {
+      const [top] = index.search(c.claim, 1);
+      return top ? { text: top.doc.plainText, source: top.doc.sourceFile } : null;
+    });
+  }, [result, refs]);
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text, fontFamily: 'Inter, system-ui, sans-serif' }}>
@@ -1101,7 +1354,7 @@ export default function Loupe() {
 
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
           {result && (
-            <button onClick={() => setResult(null)} style={ghostBtnStyle}>
+            <button onClick={startNewVerification} style={ghostBtnStyle}>
               <ArrowLeft size={13} /> New verification
             </button>
           )}
@@ -1110,8 +1363,17 @@ export default function Loupe() {
               <Copy size={13} /> {copied ? 'Copied!' : 'Copy report'}
             </button>
           )}
-          <button onClick={() => setShowSettings(true)} style={ghostBtnStyle}>
-            <Settings size={14} /> {provider === 'custom' && customProviderName ? customProviderName : providerInfo.label}
+          {result && (
+            <button onClick={downloadReport} style={ghostBtnStyle}>
+              <Download size={13} /> Download report
+            </button>
+          )}
+          <button onClick={() => setShowSettings(true)} title="Change what checks your claims — model, provider, or API key" style={ghostBtnStyle}>
+            <Settings size={14} />
+            <span>
+              <span style={{ color: C.muted, fontWeight: 400 }}>Checking with: </span>
+              {provider === 'custom' && customProviderName ? customProviderName : providerInfo.label}
+            </span>
           </button>
         </div>
       </div>
@@ -1136,10 +1398,9 @@ export default function Loupe() {
         {!result && !loading && (
           <div className="setup">
             <div style={{ textAlign: 'center' }}>
-              <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: '-0.02em', margin: 0 }}>Verify a paper</h1>
-              <p style={{ fontSize: 14.5, color: C.muted, marginTop: 10, lineHeight: 1.6, maxWidth: 560, marginLeft: 'auto', marginRight: 'auto' }}>
-                Upload your paper and its reference sources. Every cited claim gets checked against them,
-                and anything stated with no citation gets flagged for your own review.
+              <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: '-0.02em', margin: 0 }}>Verify your paper's claims</h1>
+              <p style={{ fontSize: 13, color: C.muted, marginTop: 8, lineHeight: 1.55, maxWidth: 480, marginLeft: 'auto', marginRight: 'auto' }}>
+                Checks every citation against your sources and flags anything stated without one.
               </p>
               <div style={{
                 display: 'inline-flex', alignItems: 'center', gap: 7, marginTop: 16, fontSize: 11.5, color: C.muted,
@@ -1166,13 +1427,20 @@ export default function Loupe() {
 
             <div className="setup-grid">
               <div>
-                <div style={labelStyle}>Paper to verify <span style={{ color: C.red, fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>required</span></div>
-                <div style={{ background: C.card, border: `1px solid ${paper ? C.teal + '44' : C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={labelStyle}>Paper to verify <span style={{ color: C.red, fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>required</span></div>
+                  {!paper && !paperTxt.trim() && (lastPaper || lastPaperTxt.trim()) && (
+                    <button onClick={restorePaper} style={{ background: 'none', border: 'none', color: C.teal, cursor: 'pointer', fontSize: 11.5, marginBottom: 12 }}>
+                      Restore previous paper
+                    </button>
+                  )}
+                </div>
+                <div style={{ background: C.card, border: `1px solid ${paper ? C.green + '44' : C.border}`, borderRadius: 12, overflow: 'hidden' }}>
                   {paper ? (
                     <div style={{ padding: '18px 20px', display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <FileText size={18} color={C.teal} />
+                      <FileText size={18} color={C.green} />
                       <div style={{ flex: 1, overflow: 'hidden' }}>
-                        <div style={{ fontSize: 13.5, fontWeight: 600, color: C.teal, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{paper.name}</div>
+                        <div style={{ fontSize: 13.5, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{paper.name}</div>
                         <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
                           {paper.type === 'pdf'
                             ? (singlePassPdf ? 'PDF document · single-pass (native, no chunking)' : 'PDF document · read as extracted text')
@@ -1183,39 +1451,86 @@ export default function Loupe() {
                         <Trash2 size={15} />
                       </button>
                     </div>
+                  ) : (pasteMode || paperTxt.trim()) ? (
+                    <>
+                      <textarea value={paperTxt} onChange={e => setPaperTxt(e.target.value)} placeholder="Paste the paper text here…" autoFocus
+                                style={{
+                                  width: '100%', minHeight: paperTxt.trim() ? 340 : 160, background: 'transparent', border: 'none', outline: 'none',
+                                  padding: '16px 20px', color: C.text, fontSize: 13, lineHeight: 1.65, resize: 'vertical', fontFamily: 'inherit',
+                                  boxSizing: 'border-box', overflowWrap: 'break-word',
+                                }} />
+                      <div style={{ borderTop: `1px solid ${C.border}`, padding: '10px 20px' }}>
+                        {paperTxt.trim() ? (
+                          <button onClick={() => setPaperTxt('')} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 12 }}>
+                            Clear text
+                          </button>
+                        ) : (
+                          <button onClick={() => setPasteMode(false)} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 12 }}>
+                            ← Back to file upload
+                          </button>
+                        )}
+                      </div>
+                    </>
                   ) : (
-                    <DropZone label="Upload paper" sub=".txt · .docx · .pdf" onFile={handlePaper} flush />
+                    <>
+                      <DropZone label="Upload paper" sub=".txt · .docx · .pdf" onFile={handlePaper} busy={uploadingPaper} flush />
+                      <div style={{ borderTop: `1px solid ${C.border}`, padding: '10px 20px', textAlign: 'center' }}>
+                        <button onClick={() => setPasteMode(true)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.muted, cursor: 'pointer', fontSize: 12, padding: '7px 16px' }}>
+                          Or paste text instead
+                        </button>
+                      </div>
+                    </>
                   )}
-                  <div style={{ borderTop: `1px solid ${C.border}` }} />
-                  <textarea value={paperTxt} onChange={e => setPaperTxt(e.target.value)} placeholder="Or paste the paper text here…"
-                            style={{
-                              width: '100%', minHeight: 130, background: 'transparent', border: 'none', outline: 'none',
-                              padding: '16px 20px', color: C.text, fontSize: 13, lineHeight: 1.65, resize: 'vertical', fontFamily: 'inherit',
-                            }} />
                 </div>
                 {isChunkable && (
-                  <div style={{ fontSize: 11.5, color: C.faint, marginTop: 8 }}>
+                  <div style={{ fontSize: 11.5, color: C.muted, marginTop: 8 }}>
                     ~{estChunks} chunk{estChunks !== 1 ? 's' : ''} · ~{estCalls} API call{estCalls !== 1 ? 's' : ''} to check every cited claim
                   </div>
                 )}
                 {providerInfo.kind === 'browser' && browserClaimEstimate > 0 && (
-                  <div style={{ fontSize: 11.5, color: C.faint, marginTop: 8 }}>
+                  <div style={{ fontSize: 11.5, color: C.muted, marginTop: 8 }}>
                     ~{browserClaimEstimate} cited claim{browserClaimEstimate !== 1 ? 's' : ''} detected — no API calls, runs entirely on-device
                   </div>
                 )}
               </div>
 
               <div>
-                <div style={labelStyle}>Reference sources</div>
-                <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
-                  <DropZone label="Upload sources (multiple)" sub=".txt · .docx · .pdf" multi onFiles={handleRefs} flush />
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={labelStyle}>Reference sources</div>
+                  {refs.length === 0 && lastRefs.length > 0 && (
+                    <button onClick={restoreRefs} style={{ background: 'none', border: 'none', color: C.teal, cursor: 'pointer', fontSize: 11.5, marginBottom: 12 }}>
+                      Restore previous sources
+                    </button>
+                  )}
                 </div>
-                {refs.length > 0 ? (
-                  <div style={{ marginTop: 14, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    {refs.map((r, i) => <FileChip key={i} name={r.name} onRemove={() => setRefs(prev => prev.filter((_, j) => j !== i))} />)}
+                <div style={{ background: C.card, border: `1px solid ${refs.length ? C.green + '44' : C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+                  {refs.length > 0 ? (
+                    <div style={{ padding: '14px 16px 4px', display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 240, overflowY: 'auto' }}>
+                      {refs.map((r, i) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, padding: '9px 12px' }}>
+                          <FileText size={14} color={C.green} style={{ flexShrink: 0 }} />
+                          <span style={{ flex: 1, fontSize: 12.5, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.name}</span>
+                          <button onClick={() => setRefs(prev => prev.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', color: C.red, cursor: 'pointer', fontSize: 16, lineHeight: 1, padding: 0, flexShrink: 0 }}>×</button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <DropZone label="Upload sources (multiple)" sub=".txt · .docx · .pdf" multi onFiles={handleRefs} busy={uploadingRefs} flush />
+                  )}
+                  <div style={{ borderTop: refs.length ? `1px solid ${C.border}` : 'none', marginTop: refs.length ? 10 : 0 }}>
+                    {refs.length > 0 ? (
+                      <DropZone label="Add more sources" multi onFiles={handleRefs} busy={uploadingRefs} flush compact />
+                    ) : (
+                      <div style={{ borderTop: `1px solid ${C.border}`, padding: '10px 20px', textAlign: 'center' }}>
+                        <span style={{ display: 'inline-block', border: `1px solid transparent`, borderRadius: 7, color: C.muted, cursor: 'default', fontSize: 12, padding: '7px 16px' }}>
+                          Add as many as you need
+                        </span>
+                      </div>
+                    )}
                   </div>
-                ) : (
-                  <div style={{ fontSize: 12.5, color: C.faint, marginTop: 14, lineHeight: 1.6 }}>
+                </div>
+                {refs.length === 0 && (
+                  <div style={{ fontSize: 12.5, color: C.muted, marginTop: 14, lineHeight: 1.6 }}>
                     The documents you want claims cross-checked against — papers, reports, datasets, anything with the facts your paper cites.
                   </div>
                 )}
@@ -1224,7 +1539,7 @@ export default function Loupe() {
 
             <div style={{ textAlign: 'center' }}>
               <button onClick={run} disabled={!canRun} style={{
-                background: canRun ? C.teal : C.card, color: canRun ? '#070C18' : C.faint,
+                background: canRun ? C.teal : C.card, color: canRun ? '#070C18' : C.muted,
                 border: `1px solid ${canRun ? C.teal : C.border}`, borderRadius: 10, padding: '16px 40px',
                 fontSize: 15, fontWeight: 700, cursor: canRun ? 'pointer' : 'not-allowed',
                 display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 10, transition: 'all .15s',
@@ -1239,7 +1554,7 @@ export default function Loupe() {
               {!isPaused && (
                 <div style={{ marginTop: 16 }}>
                   <button onClick={() => progressUpload.current?.click()} style={{
-                    background: 'none', border: 'none', color: C.faint, cursor: 'pointer',
+                    background: 'none', border: 'none', color: C.muted, cursor: 'pointer',
                     fontSize: 12, textDecoration: 'underline', textUnderlineOffset: 3,
                   }}>
                     Resuming on a different machine? Load a progress file
@@ -1248,7 +1563,7 @@ export default function Loupe() {
               )}
             </div>
 
-            <p style={{ fontSize: 12.5, color: C.faint, lineHeight: 1.7, textAlign: 'center', maxWidth: 620, margin: '0 auto' }}>
+            <p style={{ fontSize: 12.5, color: C.muted, lineHeight: 1.7, textAlign: 'center', maxWidth: 620, margin: '0 auto' }}>
               Text/docx papers are split into chunks so every cited claim gets checked, not just the top few — PDF papers run in a single pass.
               A dedicated pass hunts for contradictions. If a run is interrupted, progress saves automatically so you can resume it.
             </p>
@@ -1264,7 +1579,7 @@ export default function Loupe() {
               <div style={{ width: 280, display: 'flex', flexDirection: 'column', gap: 10 }}>
                 {Object.entries(modelProgress).map(([key, p]) => (
                   <div key={key}>
-                    <div style={{ fontSize: 11.5, color: C.faint, marginBottom: 4 }}>
+                    <div style={{ fontSize: 11.5, color: C.muted, marginBottom: 4 }}>
                       {key === 'embedding' ? 'Embedding model' : 'NLI model'} — {typeof p.progress === 'number' ? `${Math.round(p.progress)}%` : (p.status || 'loading')}
                     </div>
                     <ProgressBar current={typeof p.progress === 'number' ? p.progress : 0} total={100} />
@@ -1272,6 +1587,7 @@ export default function Loupe() {
                 ))}
               </div>
             )}
+            <LiveProgressPanel liveClaims={liveClaims} />
           </div>
         )}
 
@@ -1312,12 +1628,20 @@ export default function Loupe() {
               </>
             )}
 
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: result.contradictions.length ? 36 : 0, marginBottom: 16 }}>
-              Cited Claims — Checked Against Sources
-            </div>
-            {result.citedClaims.map((c, i) => <ClaimCard key={i} claim={c} />)}
+            <FilterTabs result={result} active={activeFilter} onChange={setActiveFilter} />
 
-            {result.uncitedClaims.length > 0 && (
+            {activeFilter !== 'UNCITED' && (
+              <>
+                <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: result.contradictions.length ? 36 : 0, marginBottom: 16 }}>
+                  Cited Claims — Checked Against Sources
+                </div>
+                {result.citedClaims
+                  .filter(c => activeFilter === 'ALL' || c.status === activeFilter)
+                  .map((c, i) => <ClaimCard key={i} claim={c} />)}
+              </>
+            )}
+
+            {result.uncitedClaims.length > 0 && (activeFilter === 'ALL' || activeFilter === 'UNCITED') && (
               <>
                 <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: 36, marginBottom: 10 }}>
                   Claims With No Citation
@@ -1325,7 +1649,14 @@ export default function Loupe() {
                 <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, marginBottom: 16 }}>
                   Not checked against your sources — review these yourself to confirm they're your own analysis.
                 </div>
-                {result.uncitedClaims.map((c, i) => <UncitedClaimCard key={i} claim={c} />)}
+                {result.uncitedClaims.map((c, i) => (
+                  <UncitedClaimCard
+                    key={i} claim={c} suggestion={uncitedSuggestions[i]}
+                    review={uncitedReview[i]}
+                    onMine={() => setUncitedReview(prev => ({ ...prev, [i]: 'own' }))}
+                    onHelp={() => setUncitedReview(prev => ({ ...prev, [i]: 'shown' }))}
+                  />
+                ))}
               </>
             )}
 
@@ -1352,9 +1683,14 @@ export default function Loupe() {
         ::-webkit-scrollbar-thumb { background: ${C.border}; border-radius: 3px; }
         textarea:focus, input:focus, select:focus { border-color: ${C.teal} !important; }
 
-        .main-area { padding: 56px 32px 80px; }
+        .main-area { padding: 56px 32px 80px; overflow-x: hidden; }
         .setup { max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
         .setup-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+        /* Grid items default to a min-width equal to their content's intrinsic
+           width — one long unbroken string (a filename, a URL pasted into the
+           paper text) can force a column, and the whole grid, wider than the
+           viewport without this. */
+        .setup-grid > div { min-width: 0; }
         .results { max-width: 880px; margin: 0 auto; }
 
         @media (max-width: 760px) {
