@@ -93,7 +93,9 @@ Open the URL it prints, click the settings icon to add an API key for whichever 
 
 [`src-tauri/`](src-tauri) wraps the same app into a [Tauri](https://tauri.app) desktop build — a real installer (`.exe`/`.msi` on Windows, `.dmg` on macOS, `.AppImage`/`.deb` on Linux), no browser tab or terminal needed to run it once installed. Worth it mainly if you want it to feel like a native app (dock/taskbar icon, its own window) rather than for any functional difference from option 1 or 2 — it's the identical frontend, just bundled.
 
-No pre-built installer is published yet — [`.github/workflows/release.yml`](.github/workflows/release.yml) can build one for every platform, but that still needs a maintainer to trigger and publish it. Until then, building one yourself locally is the only option:
+Download the latest installer from the [Releases page](https://github.com/YasirM0/loupe/releases/latest) — Windows (`.exe`/`.msi`), Linux (`.deb`/`.rpm`/`.AppImage`), and macOS on Apple Silicon (`.dmg`). No installer for Intel Macs yet.
+
+To build one yourself instead — for a platform without a published installer, or to build from a commit newer than the latest release:
 
 ```bash
 npm install
