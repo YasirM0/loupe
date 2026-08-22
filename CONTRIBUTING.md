@@ -23,6 +23,12 @@ Add an entry to `EMBED_MODELS` or `NLI_MODELS` in `src/Loupe.jsx` with the Huggi
 
 The grounding rules live in `ABSOLUTE_RULES`, shared between the claim-checking prompt (`claimInstructions`) and the contradiction-hunting prompt (`CONTRADICTION_INSTRUCTIONS`). Keep both prompts returning the same JSON shape the UI expects (see the `citedClaims` / `uncitedClaims` / `contradictions` schemas inline) — changing a field name means updating the corresponding render code (`ClaimCard`, `UncitedClaimCard`, `ContradictionCard`) too.
 
+## Deployment
+
+Every push to `main` rebuilds and redeploys the live site at [yasirm0.github.io/loupe](https://yasirm0.github.io/loupe/) via [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) — there's no separate staging step or manual publish. Treat `main` accordingly: it's meant to always be in a working, verifiable state, not a place to land half-finished changes.
+
+The desktop app is separate and doesn't auto-publish — pushing a `v*` tag builds installers via [`.github/workflows/release.yml`](.github/workflows/release.yml) into a draft [GitHub Release](https://github.com/YasirM0/loupe/releases) that still needs a maintainer to review and publish.
+
 ## Pull requests
 
 Small, focused changes are easiest to review. If you're adding a feature, a one-paragraph description of the use case in the PR body is more useful than a long implementation writeup — the diff speaks for the implementation.

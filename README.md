@@ -4,6 +4,8 @@
 
 No account, no upload to a third-party server, no internet search. It's a citation-accuracy checker and reference-verification tool for anyone who needs to sanity-check a paper, literature review, thesis chapter, or AI-assisted draft before it goes out the door: authors, reviewers, editors, and students.
 
+**[Try it now — yasirm0.github.io/loupe](https://yasirm0.github.io/loupe/)**, no install. See [Using it](#using-it) for the local-dev and desktop-app options too.
+
 > If you searched "Loupe" and landed here expecting a jeweler's magnifying glass — that's exactly where the name comes from. This is that same idea of close, careful examination, applied to a paper's citations.
 
 ## What it does
@@ -87,9 +89,17 @@ Both models (~32MB + ~233MB by default) download once from the Hugging Face Hub 
 
 **Be honest about the trade-off**: even with the best-measured models and all three guards, this is meaningfully more limited than an LLM-based provider. Claim detection is rule-based, not semantic understanding, so it will miss claims an LLM would catch and occasionally flag ones that aren't real claims. Beyond the specific patterns the guards catch, NLI models are still less reliable than LLMs at general numeric reasoning and multi-sentence context — the guards close measured gaps, not the whole category. The larger default models and wider evidence pool (top-5, not top-3) push it as close to LLM-level judgment as this approach reasonably gets — but it's a different technique, not a compressed copy of an LLM, and it won't always agree with what an LLM-based provider would say about the same claim.
 
-## Running it
+## Using it
 
-Requires [Node.js](https://nodejs.org) 18+.
+Three ways to run Loupe, from least to most setup. All three are the same app — no account system or server ties them together, so pick whichever fits and switch anytime; a saved API key or in-progress verification stays in that browser/install's local storage either way, not shared across them.
+
+### 1. Open it in a browser — no install
+
+**[yasirm0.github.io/loupe](https://yasirm0.github.io/loupe/)** — the live build of this repo's `main` branch, deployed automatically by [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) on every push. Nothing to clone, install, or build; it's the same static site the other two options below produce, just already running. Bookmark it or add it to your phone/desktop home screen like any other web page — it stays a normal browser tab, updating with the repo, and everything in [Privacy](#privacy--read-this-first) still applies (nothing is uploaded to us; it just serves the page).
+
+### 2. Run it from source
+
+For local development, or if you'd rather not depend on the hosted copy. Requires [Node.js](https://nodejs.org) 18+.
 
 ```bash
 git clone https://github.com/YasirM0/loupe.git
@@ -100,11 +110,11 @@ npm run dev
 
 Open the URL it prints, click the settings icon to add an API key for whichever provider you're using, upload your paper and reference sources, and click **Verify Claims**.
 
-### Desktop app
+### 3. Install it as a desktop app
 
-[`src-tauri/`](src-tauri) wraps this into a [Tauri](https://tauri.app) desktop app — a real installer (`.exe`/`.msi` on Windows, `.dmg` on macOS, `.AppImage`/`.deb` on Linux), no terminal required to run it once installed.
+[`src-tauri/`](src-tauri) wraps the same app into a [Tauri](https://tauri.app) desktop build — a real installer (`.exe`/`.msi` on Windows, `.dmg` on macOS, `.AppImage`/`.deb` on Linux), no browser tab or terminal needed to run it once installed. Worth it mainly if you want it to feel like a native app (dock/taskbar icon, its own window) rather than for any functional difference from option 1 or 2 — it's the identical frontend, just bundled.
 
-Pushing a version tag (`git tag v0.1.0 && git push --tags`) triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds all three natively on their own OS in CI and attaches the installers to a [GitHub Release](https://github.com/YasirM0/loupe/releases) as a draft — cross-compiling desktop installers locally is unreliable, so this repo doesn't try to.
+Pushing a version tag (`git tag v0.1.0 && git push --tags`) triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds all three natively on their own OS in CI and attaches the installers to a [GitHub Release](https://github.com/YasirM0/loupe/releases) as a draft for the maintainer to review and publish — cross-compiling desktop installers locally is unreliable, so this repo doesn't try to. No release has been cut yet as of this writing; building locally (below) is the only way to get an installer until the first tag is pushed.
 
 To build one yourself locally instead:
 

@@ -5,7 +5,7 @@
   "description": "Check a research paper's citations against your own source documents — locally, with your own AI provider key.",
   "license": "MIT",
   "author": "Yasir Mohammed (https://github.com/YasirM0)",
-  "homepage": "https://github.com/YasirM0/loupe",
+  "homepage": "https://yasirm0.github.io/loupe/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/YasirM0/loupe.git"
