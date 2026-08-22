@@ -52,42 +52,21 @@ The settings panel presents these in three tiers, in order:
 
    Type something we don't recognize and it just becomes a custom entry — fill in the base URL, model, and key yourself. If someone has an API key for a provider we don't know by name, they almost certainly know its base URL already.
 
-All of these except Anthropic speak the same OpenAI-compatible `chat/completions` shape, so adding another one is just adding a base URL — that's also why an unrecognized custom entry defaults to that shape rather than asking which format it speaks.
-
 **PDF support**: every provider handles PDFs now, just not identically. Anthropic reads the PDF's bytes natively (best fidelity — tables, figures, layout). Every other provider — including the local-AI and bring-your-own-key ones — gets the text [`pdfjs-dist`](https://github.com/mozilla/pdf.js) extracts from the PDF client-side, same as a `.txt` upload from that point on. That's a deliberate "support it as broadly as possible without pretending it's the same fidelity everywhere" choice: a PDF with complex tables may extract messily outside Anthropic, but it isn't blocked.
 
 ### Local — no API key, no setup
 
 This is the recommended default: no account, no payment, nothing to configure. It doesn't call any LLM. Instead:
 
-1. **Retrieval**: reference documents are split into sentences and indexed with [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) (classic lexical search), then an embedding model ([`all-MiniLM-L12-v2`](https://huggingface.co/Xenova/all-MiniLM-L12-v2) by default) reranks the top candidates semantically.
-2. **Claim detection**: sentences in your paper are flagged as claims by simple rules — carries a citation (APA/Chicago author-date — parenthetical or narrative, "Smith (2020)" as well as "(Smith, 2020)" — or bracketed/numeric like `[3]`), contains a number/statistic, uses a causal verb ("shows", "demonstrates", "found that", "flagged"), or a comparative ("higher than", "increased").
-3. **Reasoning**: for each cited claim, an NLI (natural-language-inference) model ([`deberta-v3-base-tasksource-nli`](https://huggingface.co/sileod/deberta-v3-base-tasksource-nli) by default) checks whether each of the top-5 retrieved reference sentences actually supports, contradicts, or is unrelated to the claim, then three deterministic guards in `src/lib/nli.js` catch specific failure patterns the model itself doesn't reliably catch — see below.
+1. **Retrieval** finds the sentences in your sources most relevant to each claim, using a small embedding model.
+2. **Claim detection** flags sentences worth checking — ones with a citation, a number, a causal verb ("shows", "found that"), or a comparison ("higher than").
+3. **Reasoning** checks whether the retrieved sentences actually support, contradict, or say nothing about the claim, using a small NLI (natural-language-inference) model, backed up by a few deterministic checks for patterns those models tend to miss on their own — like a claim citing a number that doesn't match what its source says.
 
-Both models (~32MB + ~233MB by default) download once from the Hugging Face Hub the first time you use this option and are cached by the browser — after that, verification runs fully offline. Everything happens inside a Web Worker so the page stays responsive during inference. Model choice, and the (advanced, collapsed by default) retrieval-method setting, live in the settings panel.
+Both models (~32MB + ~233MB) download once from Hugging Face the first time you use this option and are cached by your browser — after that, verification runs fully offline. Everything happens in a Web Worker so the page stays responsive. Model choice lives in the settings panel.
 
-#### Model quality — measured, not guessed
+Which specific models are used, and why, is a longer story than belongs here — see [`bench/run.mjs`](bench/run.mjs) for the full measured comparison and reasoning behind each pick, and [CONTRIBUTING.md](CONTRIBUTING.md) if you want to add or change one.
 
-`bench/run.mjs` runs a small hand-built test set against every model option using the exact same classification code the app runs in production (`src/lib/nli.js`), and prints real accuracy numbers. Run it yourself with `npm run bench`. Current results — 6 retrieval test cases, 14 reasoning test cases, so treat this as real signal from a small sample, not a rigorous benchmark:
-
-| Embedding model | Retrieval accuracy |
-|---|---|
-| `all-MiniLM-L12-v2` (default) | 100% — best top-1 precision of the tied options on a larger stress test (below) |
-| `all-MiniLM-L6-v2` | 100% — smallest and fastest; pick this over the default if size/speed matters more than the small precision edge |
-| `snowflake-arctic-embed-xs` | 50% (3/6) — a different vendor, same size class as the fast option, but noticeably weaker on this benchmark despite tying everyone on the larger stress test below; kept as the cross-vendor fallback, not a top pick |
-
-`e5-small-v2` and `snowflake-arctic-embed-s` tied at 100% here too but were dropped from the shipped list after a much larger adversarial stress test (a synthetic paper against 5 real reference documents, 1,899 indexed sentences) found every embedding model tried — old and new — tied at recall@5 on that corpus, meaning this small 6-case set is the more informative signal for ranking retrieval quality specifically. `bge-small-en-v1.5` was tested and dropped earlier: 83%, worse than the options above while also being larger. `bge-base-en-v1.5` tied at 100% but was removed too: no accuracy edge over the options above despite being ~4x their size and per-embedding time.
-
-| NLI model | Reasoning accuracy |
-|---|---|
-| `deberta-v3-base-tasksource-nli` (default) | 86%, ~233MB, ~670ms/classification — trained on a different task mixture (the [tasksource](https://huggingface.co/sileod/deberta-v3-base-tasksource-nli) collection) than the other options here |
-| `nli-deberta-v3-base` | 79%, ~233MB, ~660ms/classification — nearly identical size and speed to the default, from a different (classic MNLI/SNLI) training lineage. The backup option |
-
-`deberta-v3-base-zeroshot-v2.0` scored highest of anything tried (86%/72% — see the larger stress test below) and was briefly the default, but measuring actual per-claim classification speed (not just model load time) found it ran **~4.4x slower** than the options above — an unquantized ~704MB download that also costs an estimated ~12 extra minutes on a 50-claim paper. Demoted to a deliberate, occasional-use option rather than the default once speed was weighed alongside accuracy. `nli-deberta-v3-small` looked like the natural fast/small backup (ties the default's accuracy on the larger stress test below) but was rejected after re-checking the official small test above: 36%, missing nearly every contradiction case — a severe, previously-documented weakness this benchmark had already caught once. `mobilebert-uncased-mnli` (50%, ~100MB) was dropped earlier for the same category of flaw — it missed *every* contradiction case in testing (called them "unrelated"), which conflicts directly with a citation-contradiction-hunting tool's core job. Whenever a new model option is added, re-run the benchmark — measuring classification speed, not just load time — **and check which ONNX variants actually exist in that repo** before wiring it in; never hand-write a percentage or assume a quantized file exists.
-
-**Three deterministic guards cover specific model weaknesses the numbers above can't show.** A large adversarial stress test (a synthetic paper against 5 real reference documents, 1,899 indexed sentences) found blind spots shared across every NLI model tried, regardless of size or vendor: (1) a claim citing a specific percentage that doesn't match the evidence's actual number often still gets called "supported" — models judge topical alignment far more reliably than numeric magnitude; (2) a claim asserting the *complete absence* of something ("no evidence of X whatsoever") that the evidence actually contradicts often lands just under the model's own contradiction threshold instead of over it; (3) several models are systematically under-confident on clear matches — a claim whose supported score is clearly dominant (2x+ the other two) still lands in "partial" rather than "supported" because it falls just short of a fixed 0.75 cutoff. `applyNumericGuard()`, `applyNegationGuard()`, and `applyDominantSupportGuard()` in `src/lib/nli.js` catch these three patterns deterministically, on top of whichever NLI model is selected. All three were validated by simulating them against real captured model scores *before* shipping, specifically to confirm each one fixed its target case without causing collateral damage elsewhere — a broader, less targeted version of the negation guard was tried and rejected after simulation showed it would have broken the pipeline's single most important safeguard (catching a fabricated claim wearing a real author's name) more often than it fixed the case it targeted; the dominant-support guard has one known, documented trade-off (it can't distinguish a claim with accurate numbers but overstated scope from a genuinely fully-supported one), accepted because it costs at most one point on two non-default models and nothing on the shipped default.
-
-**Be honest about the trade-off**: even with the best-measured models and all three guards, this is meaningfully more limited than an LLM-based provider. Claim detection is rule-based, not semantic understanding, so it will miss claims an LLM would catch and occasionally flag ones that aren't real claims. Beyond the specific patterns the guards catch, NLI models are still less reliable than LLMs at general numeric reasoning and multi-sentence context — the guards close measured gaps, not the whole category. The larger default models and wider evidence pool (top-5, not top-3) push it as close to LLM-level judgment as this approach reasonably gets — but it's a different technique, not a compressed copy of an LLM, and it won't always agree with what an LLM-based provider would say about the same claim.
+**Be honest about the trade-off**: this is more limited than an LLM-based provider. Claim detection is rule-based, not true understanding, so it can miss claims an LLM would catch or flag ones that aren't real claims. It's a different technique, not a compressed copy of an LLM — it won't always agree with what an LLM-based provider would say about the same claim.
 
 ## Using it
 
@@ -114,9 +93,7 @@ Open the URL it prints, click the settings icon to add an API key for whichever 
 
 [`src-tauri/`](src-tauri) wraps the same app into a [Tauri](https://tauri.app) desktop build — a real installer (`.exe`/`.msi` on Windows, `.dmg` on macOS, `.AppImage`/`.deb` on Linux), no browser tab or terminal needed to run it once installed. Worth it mainly if you want it to feel like a native app (dock/taskbar icon, its own window) rather than for any functional difference from option 1 or 2 — it's the identical frontend, just bundled.
 
-Pushing a version tag (`git tag v0.1.0 && git push --tags`) triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds all three natively on their own OS in CI and attaches the installers to a [GitHub Release](https://github.com/YasirM0/loupe/releases) as a draft for the maintainer to review and publish — cross-compiling desktop installers locally is unreliable, so this repo doesn't try to. No release has been cut yet as of this writing; building locally (below) is the only way to get an installer until the first tag is pushed.
-
-To build one yourself locally instead:
+No pre-built installer is published yet — [`.github/workflows/release.yml`](.github/workflows/release.yml) can build one for every platform, but that still needs a maintainer to trigger and publish it. Until then, building one yourself locally is the only option:
 
 ```bash
 npm install
@@ -156,7 +133,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Author
 
-Built by [Yasir Mohammed](https://github.com/YasirM0).
+Built by [Yasir Mohammed](https://github.com/YasirM0), with [Claude Code](https://claude.com/claude-code) as a coding assistant throughout implementation.
 
 ## License
 
