@@ -870,7 +870,7 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
           ) : provider === 'browser' ? (
             <>
               <div style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.65, background: C.tealBg, border: `1px solid ${C.teal}22`, borderRadius: 8, padding: '10px 12px' }}>
-                No API key, no account, no server. Two models download once to this browser and are cached — after that it works offline. Quality is more limited than an LLM-based provider (rule-based claim detection, embedding + NLI reasoning instead of full language understanding), but there's nothing to pay for and nothing to configure. The defaults are already the best-measured options below (real test results, not a guess) — most people don't need to open "Advanced."
+                No API key, no account, no server. Your <b>first</b> verification needs internet once, to download two small models to this browser (they're cached after that) — every verification after that runs fully offline, unless you switch to an API-key provider below, which always needs a connection. Quality is more limited than an LLM-based provider (rule-based claim detection, embedding + NLI reasoning instead of full language understanding), but there's nothing to pay for and nothing to configure. The defaults are already the best-measured options below (real test results, not a guess) — most people don't need to open "Advanced."
               </div>
               <button onClick={() => setShowAdvanced(v => !v)} style={{
                 background: 'none', border: 'none', color: C.teal, cursor: 'pointer',
@@ -1597,6 +1597,9 @@ export default function Loupe() {
             {liveChunk && <div style={{ width: 280 }}><ProgressBar current={liveChunk.current} total={liveChunk.total} /></div>}
             {modelProgress && Object.keys(modelProgress).length > 0 && (
               <div style={{ width: 280, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ fontSize: 11.5, color: C.muted, textAlign: 'center' }}>
+                  One-time download — needs internet now, then this runs offline every time after.
+                </div>
                 {Object.entries(modelProgress).map(([key, p]) => (
                   <div key={key}>
                     <div style={{ fontSize: 11.5, color: C.muted, marginBottom: 4 }}>
