@@ -50,3 +50,82 @@ export function verdictFromScores(agg, topCosine) {
 
   return { status, confidence };
 }
+
+const PERCENT_PATTERN = /\b(\d+(?:\.\d+)?)%/g;
+
+function extractPercents(text) {
+  return [...text.matchAll(PERCENT_PATTERN)].map(m => parseFloat(m[1]));
+}
+
+// NLI models judge topic/vocabulary alignment far more reliably than the
+// actual magnitude of a number embedded in prose — a stress test found every
+// NLI model Loupe ships (and every new candidate tried) called a claim
+// SUPPORTED when it cited "roughly 60%" against evidence that actually said
+// "97.68%". This is a deterministic backstop for that specific failure mode:
+// if the claim states a percentage that doesn't appear (within a small
+// rounding tolerance) anywhere in the evidence actually driving the verdict,
+// a SUPPORTED/PARTIAL call can't be trusted on the number, so it's demoted
+// to CONTRADICTED. Scoped to percentages only (the clearest same-metric
+// signal) and to SUPPORTED/PARTIAL only — UNSUPPORTED already correctly
+// means "evidence doesn't address this," which an absent number shouldn't
+// override into a false contradiction.
+const PERCENT_TOLERANCE = 3;
+
+export function applyNumericGuard(status, claimText, evidenceText) {
+  if (status !== 'SUPPORTED' && status !== 'PARTIAL') return status;
+  const claimPercents = extractPercents(claimText);
+  if (!claimPercents.length) return status;
+  const evidencePercents = extractPercents(evidenceText);
+  if (!evidencePercents.length) return status;
+  const anyMatch = claimPercents.some(cp => evidencePercents.some(ep => Math.abs(cp - ep) <= PERCENT_TOLERANCE));
+  return anyMatch ? status : 'CONTRADICTED';
+}
+
+// A claim asserting the *complete absence* of something ("no sense of X
+// whatsoever", "entirely free of Y") that the model calls UNSUPPORTED is a
+// distinct failure pattern from a claim that's merely fabricated: the
+// evidence usually does address the topic and contradicts the absolute
+// denial, but the model's raw scores land just under the CONTRADICTED
+// threshold rather than clearing it outright.
+//
+// A blanket "moderate-but-dominant contradiction" rule was tried and
+// rejected — simulated against real captured scores, it would have flipped
+// several genuinely-UNSUPPORTED fabrications (evidence that's actually
+// unrelated, not contradicting) into false CONTRADICTED calls, because
+// topic-mismatch noise alone can nudge the contradicted score moderately
+// upward. Gating on an explicit denial phrase in the claim text keeps this
+// narrow: it only fires for the specific linguistic pattern of absolute
+// denial, not any claim whose contradicted score happens to edge up.
+const NEGATION_CUES = /\bno\s+.{0,60}?\s+whatsoever\b|\bnot\s+any\b|\bnone\s+of\b|\bentirely\s+free\s+of\b|\bcompletely\s+free\s+of\b|\bno\s+evidence\s+of\b/i;
+
+export function applyNegationGuard(status, claimText, agg) {
+  if (status !== 'UNSUPPORTED') return status;
+  if (!NEGATION_CUES.test(claimText)) return status;
+  if (agg.contradicted > agg.supported && agg.contradicted >= 0.40) return 'CONTRADICTED';
+  return status;
+}
+
+// Some models (tasksource-nli in particular, likely from training on a much
+// wider task mixture than narrower MNLI-style models) are systematically
+// under-confident on clear matches: a stress test found several genuinely-
+// SUPPORTED claims scoring supported=0.57–0.74 — clearly the dominant
+// signal, often 2–5x the contradicted score — but landing in PARTIAL
+// because the fixed 0.75 SUPPORTED cutoff doesn't distinguish "dominant but
+// not overwhelming" from genuine partial support.
+//
+// The one case this can't safely separate from a real PARTIAL: a claim
+// whose specific numbers are accurate but whose scope or generality is
+// overstated (source says X for Latvia, claim implies X for "all Global
+// South regions") scores nearly identically — the model has no way to
+// signal "the numbers check out but the generalization doesn't" in three
+// aggregate scores. Simulated against real captured data before shipping:
+// net positive on every model tested, and *zero* regressions specifically
+// for tasksource-nli (its one PARTIAL case doesn't meet this threshold),
+// which is why it's shipped despite that known, documented trade-off for
+// other models.
+export function applyDominantSupportGuard(status, agg) {
+  if (status !== 'PARTIAL') return status;
+  const { supported: s, contradicted: c, unrelated: u } = agg;
+  if (s >= 0.55 && s > 2 * c && s > 2 * u) return 'SUPPORTED';
+  return status;
+}

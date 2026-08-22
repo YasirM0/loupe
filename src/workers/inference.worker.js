@@ -1,6 +1,6 @@
 import { pipeline, env } from '@huggingface/transformers';
 import { BM25Index, cosineSimilarity } from '../lib/bm25.js';
-import { classifyPairsBatch, verdictFromScores } from '../lib/nli.js';
+import { classifyPairsBatch, verdictFromScores, applyNumericGuard, applyNegationGuard, applyDominantSupportGuard } from '../lib/nli.js';
 
 env.allowLocalModels = false;
 
@@ -159,7 +159,10 @@ async function verifyClaims(claims, retrievalMethod) {
       }
     }
 
-    const { status, confidence } = verdictFromScores(best, topCosine);
+    let { status, confidence } = verdictFromScores(best, topCosine);
+    status = applyNumericGuard(status, claim.text, bestDoc.plainText);
+    status = applyDominantSupportGuard(status, best);
+    status = applyNegationGuard(status, claim.text, best);
     self.postMessage({
       type: 'CLAIM_RESULT',
       claimIndex: claim.index,

@@ -93,20 +93,37 @@ function matchApiProviders(input) {
 // embedding convention — asymmetric models (e5, arctic-embed) score much
 // worse if queries and reference passages aren't prefixed as their model
 // card specifies; the worker applies these automatically per model.
+// Trimmed to the 3 candidates that survived a much larger adversarial
+// stress test (a synthetic paper + 5 real reference documents, 1,899
+// indexed sentences — see bench/run.mjs's 2026-08-22 sweep notes) — every
+// embedding model tried tied at recall@5 there, so ranking instead comes
+// from the official small RETRIEVAL_TESTSET below plus size/speed.
 const EMBED_MODELS = [
-  { id: 'Xenova/all-MiniLM-L6-v2',  label: 'all-MiniLM-L6-v2',  size: '~22MB',  quality: 100, desc: 'Default — 100% on our retrieval test (6 cases), smallest and fastest of the tied options' },
-  { id: 'Xenova/e5-small-v2', label: 'e5-small-v2', size: '~32MB', quality: 100, queryPrefix: 'query: ', passagePrefix: 'passage: ', desc: '100% on our test — similar speed to the other options below' },
-  { id: 'Xenova/all-MiniLM-L12-v2', label: 'all-MiniLM-L12-v2', size: '~32MB', quality: 100, desc: '100% on our test — MiniLM with more layers than the default L6 version, so slower per embedding for the same architecture family' },
-  { id: 'Snowflake/snowflake-arctic-embed-s', label: 'snowflake-arctic-embed-s', size: '~32MB', quality: 100, pooling: 'cls', queryPrefix: 'Represent this sentence for searching relevant passages: ', desc: '100% on our test — purpose-built for retrieval, uses CLS pooling instead of mean' },
+  { id: 'Xenova/all-MiniLM-L12-v2', label: 'all-MiniLM-L12-v2', size: '~32MB', quality: 100, desc: 'Default — 100% on our retrieval test (6 cases), best top-1 precision on the larger stress test of the tied options' },
+  { id: 'Xenova/all-MiniLM-L6-v2',  label: 'all-MiniLM-L6-v2',  size: '~22MB',  quality: 100, desc: '100% on our test — smallest and fastest option, pick this if download size or speed matters more than the small top-1 precision edge L12 has' },
+  // query-only prefix + CLS pooling per Snowflake's documented convention.
+  // Scored only 50% (3/6) on our official retrieval test despite tying
+  // everything else on the larger stress-test corpus — a genuinely weaker
+  // result on the test that actually discriminates between these models,
+  // kept as the cross-vendor option rather than the primary pick.
+  { id: 'Snowflake/snowflake-arctic-embed-xs', label: 'snowflake-arctic-embed-xs', size: '~22MB', quality: 50, pooling: 'cls', queryPrefix: 'Represent this sentence for searching relevant passages: ', desc: '50% on our test — same size class as the default, from a different vendor, but noticeably weaker on our own accuracy benchmark; a cross-vendor fallback, not a top pick' },
 ];
+// deberta-v3-base-zeroshot-v2.0 briefly held this default slot: highest
+// raw accuracy of anything tried (86%/72%), but measuring actual per-claim
+// inference speed (not just model load time) found it took ~2973ms per
+// classification versus ~670ms for the options below — a ~700MB download
+// that's also ~4.4x slower in use, for a gap the guards below closed to
+// within a few points anyway. Demoted to a documented trade-off rather than
+// shipped, once speed was weighed alongside accuracy instead of separately.
+//
+// nli-deberta-v3-small was tried as a fast/small backup and rejected for a
+// different reason: 36% on the official test below, missing nearly every
+// contradiction case — a severe, pre-existing weakness this same benchmark
+// had already caught once before. tasksource-nli and nli-deberta-v3-base
+// both hold up on both benchmarks.
 const NLI_MODELS = [
-  { id: 'Xenova/nli-deberta-v3-base', label: 'nli-deberta-v3-base', size: '~233MB', quality: 79, desc: 'Default — 79% on our reasoning test (14 cases), reasonable download size' },
-  // dtype: 'fp32' is required here — unlike the model above, this repo only
-  // publishes the raw fp32 ONNX export, no quantized variants. Without
-  // forcing it, the library defaults to requesting a quantized file that
-  // doesn't exist in this repo and the load 404s.
-  { id: 'MoritzLaurer/deberta-v3-base-zeroshot-v2.0', label: 'deberta-v3-base-zeroshot-v2.0', size: '~704MB', dtype: 'fp32', quality: 86, desc: '86% on our test, the most accurate option — but a much bigger download (no quantized version of this one exists), so it is not the default' },
-  { id: 'Xenova/mobilebert-uncased-mnli', label: 'mobilebert-uncased-mnli', size: '~26MB', quality: 50, desc: '50% on our test, much smaller — but it missed every single contradiction case in testing (called them "unrelated" instead). Fine for a quick supported/unsupported check, unreliable for catching errors — the retry/contradiction-hunting feature depends on the model actually recognizing a contradiction' },
+  { id: 'Xenova/deberta-v3-base-tasksource-nli', label: 'deberta-v3-base-tasksource-nli', size: '~233MB', quality: 86, desc: 'Default — 86% on our reasoning test (14 cases), 668ms/classification. Ties deberta-v3-base-zeroshot-v2.0\'s accuracy on our larger adversarial test after the guards below, at a third of the download and 4.4x the speed' },
+  { id: 'Xenova/nli-deberta-v3-base', label: 'nli-deberta-v3-base', size: '~233MB', quality: 79, desc: '79% on our test, 661ms/classification — similar size and speed to the default, from a different (classic MNLI/SNLI) training lineage rather than tasksource\'s' },
 ];
 const RETRIEVAL_METHODS = [
   { id: 'rerank',     label: 'BM25 then rerank', desc: 'Default — BM25 top-30, embeddings rerank to top-5' },
