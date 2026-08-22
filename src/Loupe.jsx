@@ -80,6 +80,10 @@ function matchApiProviders(input) {
 // A wider sweep of MiniLM/E5/BGE-small-class candidates (2026-08-22, see
 // bench/run.mjs) found 3 more that tied the top score, included below so
 // they can be compared on real documents rather than just this 6-case set.
+// bge-base-en-v1.5 also tied that top score but was removed after real-world
+// use: it's the largest/slowest option here (~105MB, ~4x the per-embedding
+// time of the others) for no measured accuracy edge over them on an actual
+// paper, not just this synthetic test.
 //
 // `size` is the actual download size of the quantized ONNX file each model
 // loads by default (measured via HEAD request), not the larger fp32
@@ -91,8 +95,7 @@ function matchApiProviders(input) {
 // card specifies; the worker applies these automatically per model.
 const EMBED_MODELS = [
   { id: 'Xenova/all-MiniLM-L6-v2',  label: 'all-MiniLM-L6-v2',  size: '~22MB',  quality: 100, desc: 'Default — 100% on our retrieval test (6 cases), smallest and fastest of the tied options' },
-  { id: 'Xenova/bge-base-en-v1.5',  label: 'bge-base-en-v1.5',  size: '~105MB', quality: 100, desc: 'Also 100% on our test — larger, built specifically for retrieval; worth trying if MiniLM misses something on your paper' },
-  { id: 'Xenova/e5-small-v2', label: 'e5-small-v2', size: '~32MB', quality: 100, queryPrefix: 'query: ', passagePrefix: 'passage: ', desc: '100% on our test — smaller than bge-base, similar speed to the other new options' },
+  { id: 'Xenova/e5-small-v2', label: 'e5-small-v2', size: '~32MB', quality: 100, queryPrefix: 'query: ', passagePrefix: 'passage: ', desc: '100% on our test — similar speed to the other options below' },
   { id: 'Xenova/all-MiniLM-L12-v2', label: 'all-MiniLM-L12-v2', size: '~32MB', quality: 100, desc: '100% on our test — MiniLM with more layers than the default L6 version, so slower per embedding for the same architecture family' },
   { id: 'Snowflake/snowflake-arctic-embed-s', label: 'snowflake-arctic-embed-s', size: '~32MB', quality: 100, pooling: 'cls', queryPrefix: 'Represent this sentence for searching relevant passages: ', desc: '100% on our test — purpose-built for retrieval, uses CLS pooling instead of mean' },
 ];

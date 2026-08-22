@@ -46,7 +46,21 @@ export function chunkReferenceIntoSentences(sourceFile, text) {
   }));
 }
 
-const CITATION_PATTERN = /\([A-Z][a-zA-Z-]*(?:\s+(?:et al\.?|and|&)\s+[A-Z][a-zA-Z-]*)?,?\s+\d{4}[a-z]?\)|\[\d+(?:,\s*\d+)*\]/;
+// Author-date parenthetical (APA-ish and Chicago author-date — Chicago just
+// tends to omit the comma before the year, already optional here) plus
+// bracketed numeric citations (Vancouver/IEEE-style, also how a loose
+// Chicago notes style often reads once footnote markers get flattened to
+// plain text). "et al." previously and incorrectly required a name to
+// follow it (modeled on "& Name"/"and Name"), when in real usage "et al."
+// replaces the remaining names rather than introducing another one —
+// "(Rokhman et al., 2024)" never matched. It now stands alone, and a
+// comma-separated author list ("Smith, Jones, & Brown, 2020") is supported
+// too, not just a single "&"/"and" pair.
+const AUTHOR = `[A-Z][a-zA-Z'-]*`;
+const CITATION_PATTERN = new RegExp(
+  `\\(${AUTHOR}(?:,\\s*${AUTHOR})*(?:,?\\s+(?:&|and)\\s+${AUTHOR})?(?:\\s+et\\s+al\\.?)?,?\\s+\\d{4}[a-z]?\\)` +
+  `|\\[\\d+(?:[-–,]\\s*\\d+)*\\]`
+);
 const NUMBER_PATTERN = /\b\d+(\.\d+)?%|\b\d{2,}(\.\d+)?\b/;
 const CAUSAL_VERBS = /\b(shows?|demonstrat(?:es?|ed)|reveals?|indicat(?:es?|ed)|proves?|confirms?|found that|suggests?\s+that)\b/i;
 const COMPARATIVE = /\b(more than|less than|higher|lower|increased?|decreased?|significantly)\b/i;

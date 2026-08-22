@@ -80,8 +80,15 @@ results.nli['Xenova/nli-deberta-v3-base'] = await benchNli('Xenova/nli-deberta-v
 results.nli['Xenova/nli-deberta-v3-small'] = await benchNli('Xenova/nli-deberta-v3-small');
 
 results.embedding['Xenova/all-MiniLM-L6-v2'] = await benchEmbedding('Xenova/all-MiniLM-L6-v2');
-results.embedding['Xenova/bge-base-en-v1.5'] = await benchEmbedding('Xenova/bge-base-en-v1.5');
 results.embedding['Xenova/bge-small-en-v1.5'] = await benchEmbedding('Xenova/bge-small-en-v1.5');
+results.embedding['Xenova/e5-small-v2'] = await benchEmbedding('Xenova/e5-small-v2', {
+  query: t => `query: ${t}`, passage: t => `passage: ${t}`,
+});
+results.embedding['Xenova/all-MiniLM-L12-v2'] = await benchEmbedding('Xenova/all-MiniLM-L12-v2');
+results.embedding['Snowflake/snowflake-arctic-embed-s'] = await benchEmbedding('Snowflake/snowflake-arctic-embed-s', {
+  query: t => `Represent this sentence for searching relevant passages: ${t}`,
+  pooling: 'cls',
+});
 
 console.log('\n\n=== FINAL RESULTS (JSON) ===');
 console.log(JSON.stringify(results, null, 2));
@@ -105,7 +112,10 @@ console.log(JSON.stringify(results, null, 2));
 //
 // Every new candidate that hit 100% is both larger and slower than the
 // shipped default, which already wins every axis — so nothing here changed
-// EMBED_MODELS. This also means the *specific* recurring contradiction the
+// EMBED_MODELS. bge-base-en-v1.5 was subsequently removed from EMBED_MODELS
+// entirely after real-world use confirmed the same thing this bench already
+// showed: no accuracy edge over the smaller/faster options, just slower.
+// This also means the *specific* recurring contradiction the
 // user hit is not an embedding-model-quality problem: their own real-paper
 // test showed the same contradiction from both MiniLM-L6 and bge-base, and
 // bge-base ties for best on this synthetic set too. That points at retrieval

@@ -58,11 +58,11 @@ All of these except Anthropic speak the same OpenAI-compatible `chat/completions
 
 This is the recommended default: no account, no payment, nothing to configure. It doesn't call any LLM. Instead:
 
-1. **Retrieval**: reference documents are split into sentences and indexed with [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) (classic lexical search), then an embedding model ([`bge-base-en-v1.5`](https://huggingface.co/Xenova/bge-base-en-v1.5) by default) reranks the top candidates semantically.
-2. **Claim detection**: sentences in your paper are flagged as claims by simple rules — carries a citation, contains a number/statistic, uses a causal verb ("shows", "demonstrates", "found that"), or a comparative ("higher than", "increased").
+1. **Retrieval**: reference documents are split into sentences and indexed with [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) (classic lexical search), then an embedding model ([`all-MiniLM-L6-v2`](https://huggingface.co/Xenova/all-MiniLM-L6-v2) by default) reranks the top candidates semantically.
+2. **Claim detection**: sentences in your paper are flagged as claims by simple rules — carries a citation (APA/Chicago author-date, or bracketed/numeric like `[3]`), contains a number/statistic, uses a causal verb ("shows", "demonstrates", "found that"), or a comparative ("higher than", "increased").
 3. **Reasoning**: for each cited claim, an NLI (natural-language-inference) model ([`nli-deberta-v3-base`](https://huggingface.co/Xenova/nli-deberta-v3-base) by default) checks whether each of the top-5 retrieved reference sentences actually supports, contradicts, or is unrelated to the claim.
 
-Both models (~80MB + ~350MB by default) download once from the Hugging Face Hub the first time you use this option and are cached by the browser — after that, verification runs fully offline. Everything happens inside a Web Worker so the page stays responsive during inference. Model choice, and the (advanced, collapsed by default) retrieval-method setting, live in the settings panel.
+Both models (~22MB + ~233MB by default) download once from the Hugging Face Hub the first time you use this option and are cached by the browser — after that, verification runs fully offline. Everything happens inside a Web Worker so the page stays responsive during inference. Model choice, and the (advanced, collapsed by default) retrieval-method setting, live in the settings panel.
 
 #### Model quality — measured, not guessed
 
@@ -70,10 +70,12 @@ Both models (~80MB + ~350MB by default) download once from the Hugging Face Hub 
 
 | Embedding model | Retrieval accuracy |
 |---|---|
-| `all-MiniLM-L6-v2` (default) | 100% — smallest and fastest of the two |
-| `bge-base-en-v1.5` | 100% — larger, purpose-built for retrieval; an alternative if MiniLM ever misses something |
+| `all-MiniLM-L6-v2` (default) | 100% — smallest and fastest of the tied options |
+| `e5-small-v2` | 100% |
+| `all-MiniLM-L12-v2` | 100% |
+| `snowflake-arctic-embed-s` | 100% |
 
-`bge-small-en-v1.5` was tested and dropped: 83%, worse than both options above while also being larger than MiniLM — no axis it won on.
+`bge-small-en-v1.5` was tested and dropped: 83%, worse than the options above while also being larger than the default — no axis it won on. `bge-base-en-v1.5` tied at 100% but was later removed too: on a real paper it showed no accuracy edge over the options above despite being ~4x their size and per-embedding time.
 
 | NLI model | Reasoning accuracy |
 |---|---|
