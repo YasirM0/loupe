@@ -127,7 +127,7 @@ Chunking means more API calls than a single-shot summary would — each chunk re
 
 **Can I use it without an API key?** You need a key (or a running local model) for whichever provider you pick — Loupe itself doesn't include or proxy any AI access.
 
-**Does it work offline?** The app loads and reads your files offline, but checking claims requires reaching whichever AI provider you've configured — including a local model server on your own machine, which counts as "offline" from the internet's point of view.
+**Does it work offline?** Verification itself does, once the local models are cached — no network call happens during checking, whether you're on the hosted site, running from source, or using the desktop app. What differs is loading the app the very first time on a given browser/device: the desktop app is a bundled binary, so it opens with zero connectivity from the start (only the model download needs internet, once). The browser build ([yasirm0.github.io/loupe](https://yasirm0.github.io/loupe/)) needs one successful page load before it can be reopened offline, since there's no service worker forcing the app shell into a persistent cache — after that first visit, your browser's own cache is what makes reopening it offline work. Either way, switching to an API-key provider (or Local AI pointed at a server that isn't actually running) always needs a live connection, whether that's the internet or a local server on your own machine.
 
 ## Contributing
 
