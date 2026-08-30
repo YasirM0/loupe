@@ -3,7 +3,9 @@ import { Upload, BookOpen, FileText, Trash2, CheckCircle,
          AlertCircle, XCircle, Loader, Copy, Settings, X, ArrowLeft,
          Download, AlertTriangle, ShieldCheck, ExternalLink, ChevronDown, ChevronUp } from "lucide-react";
 import { extractPdfText, extractDocxText } from "./lib/extractText.js";
-import { chunkReferenceIntoSentences, extractClaims } from "./lib/textProcessing.js";
+import { chunkReferenceIntoSentences, extractClaims, extractUncitedClaims,
+         splitReferencesSection, categorizeUncitedClaim } from "./lib/textProcessing.js";
+import { tagUnsupportedClaims, computeAdjustedScore, computeSourceCoverage } from "./lib/sourceCoverage.js";
 import { BM25Index } from "./lib/bm25.js";
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
@@ -35,6 +37,19 @@ const CONFIDENCE = {
   HIGH:   C.green,
   MEDIUM: C.amber,
   LOW:    C.muted,
+};
+
+// Why an UNSUPPORTED verdict came back UNSUPPORTED — see sourceCoverage.js's
+// tagUnsupportedClaims, which is what actually assigns unsupportedReason.
+const UNSUPPORTED_REASON_LABEL = {
+  SOURCE_NOT_UPLOADED: 'SOURCE NOT UPLOADED',
+  EXTRACTION_LIMITED: 'EXTRACTION LIMITED',
+  NOT_FOUND_IN_SOURCE: 'NOT FOUND IN SOURCE',
+};
+const UNCITED_CATEGORY_LABEL = {
+  STATISTIC: 'Statistics without citation',
+  COMPARATIVE: 'Comparative claims without citation',
+  INTERPRETIVE: 'Interpretive claims flagged by rule',
 };
 
 // ── Providers ─────────────────────────────────────────────────────────────────
@@ -149,12 +164,12 @@ async function readFile(file) {
     return { name: file.name, type: 'text', content: text, text };
   }
   if (ext === 'pdf') {
-    const [ab, text] = await Promise.all([file.arrayBuffer(), extractPdfText(file)]);
+    const [ab, { text, quality }] = await Promise.all([file.arrayBuffer(), extractPdfText(file)]);
     const u8  = new Uint8Array(ab);
     let bin   = '';
     for (let i = 0; i < u8.length; i += 8192)
       bin += String.fromCharCode(...u8.slice(i, i + 8192));
-    return { name: file.name, type: 'pdf', b64: btoa(bin), text };
+    return { name: file.name, type: 'pdf', b64: btoa(bin), text, quality };
   }
   const text = await file.text();
   return { name: file.name, type: 'text', content: text, text };
@@ -341,6 +356,9 @@ async function callLLM({ kind, apiKey, baseUrl, model, parts, instructions, onRe
   }
 }
 
+// Kept exactly as before — still used standalone by LiveProgressPanel for
+// the in-progress stats strip, which has no refs/paper-text context handy
+// and doesn't need the reason-aware adjusted score, just running counts.
 function summarize(cited, uncited, contradictions) {
   const counts = { SUPPORTED: 0, PARTIAL: 0, UNSUPPORTED: 0, CONTRADICTED: 0 };
   cited.forEach(c => { if (counts[c.status] !== undefined) counts[c.status]++; });
@@ -352,8 +370,42 @@ function summarize(cited, uncited, contradictions) {
   return { score, summary, counts };
 }
 
-function buildFinalResult(cited, uncited, contradictions) {
-  return { citedClaims: cited, uncitedClaims: uncited, contradictions, ...summarize(cited, uncited, contradictions) };
+// `paperText` is the full, un-stripped paper text (the References section is
+// still in it) — buildFinalResult finds that section itself so it can report
+// on it (entry count, source coverage) without every caller re-deriving it.
+function buildFinalResult(cited, uncited, contradictions, refs, paperText) {
+  const refInfo = splitReferencesSection(paperText || '');
+  const tagged = tagUnsupportedClaims(cited, refs);
+  const { score: rawScore, counts } = summarize(tagged, uncited, contradictions);
+  const adjustedScore = computeAdjustedScore(tagged);
+
+  const unsupportedBreakdown = { sourceNotUploaded: 0, extractionLimited: 0, notFoundInSource: 0 };
+  tagged.forEach(c => {
+    if (c.status !== 'UNSUPPORTED') return;
+    if (c.unsupportedReason === 'SOURCE_NOT_UPLOADED') unsupportedBreakdown.sourceNotUploaded++;
+    else if (c.unsupportedReason === 'EXTRACTION_LIMITED') unsupportedBreakdown.extractionLimited++;
+    else unsupportedBreakdown.notFoundInSource++;
+  });
+
+  const sourceCoverage = computeSourceCoverage(refInfo.referencesText, refInfo.body, refs);
+  const extractionWarnings = refs.filter(r => r.quality && (r.quality.largePage || r.quality.sparseText)).map(r => r.name);
+
+  // Uncited claims from the LLM-provider path don't carry a `category` —
+  // the local rule tags one at flag-time, so this only back-fills it for
+  // that path, purely for the grouped-display split below.
+  const categorizedUncited = uncited.map(c => c.category ? c : { ...c, category: categorizeUncitedClaim(c.claim) });
+
+  const total = tagged.length;
+  const summary = total
+    ? `${total} cited claim${total !== 1 ? 's' : ''} checked. ${counts.SUPPORTED} supported, ${counts.PARTIAL} partial, ${counts.UNSUPPORTED} unsupported (${unsupportedBreakdown.sourceNotUploaded} due to missing sources, ${unsupportedBreakdown.extractionLimited} due to extraction limits, ${unsupportedBreakdown.notFoundInSource} genuinely not found)${counts.CONTRADICTED ? `, ${counts.CONTRADICTED} contradicted` : ''}. ${categorizedUncited.length} sentence${categorizedUncited.length !== 1 ? 's' : ''} flagged as potentially uncited after filtering.`
+    : `No cited claims were found to check. ${categorizedUncited.length} sentence${categorizedUncited.length !== 1 ? 's' : ''} flagged as potentially uncited after filtering.`;
+
+  return {
+    citedClaims: tagged, uncitedClaims: categorizedUncited, contradictions,
+    score: adjustedScore, rawScore, counts, unsupportedBreakdown,
+    sourceCoverage, extractionWarnings, referencesInfo: refInfo,
+    summary,
+  };
 }
 
 // A raw Date.now() epoch (e.g. loupe-report-1787354121516.txt) is unreadable
@@ -498,6 +550,11 @@ function ClaimCard({ claim }) {
           {s.label}<ConfidenceTag level={claim.confidence} />
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
+          {claim.unsupportedReason && (
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: C.muted, letterSpacing: '0.05em', marginBottom: 6 }}>
+              {UNSUPPORTED_REASON_LABEL[claim.unsupportedReason]}
+            </div>
+          )}
           <div style={{ fontSize: 15, color: C.text, lineHeight: 1.6, marginBottom: 8 }}>{claim.claim}</div>
           {claim.citation && <div style={{ fontSize: 12, color: C.muted, fontStyle: 'italic', marginBottom: 8 }}>{claim.citation}</div>}
           {claim.evidence && (
@@ -557,6 +614,88 @@ function UncitedClaimCard({ claim, suggestion, review, onMine, onHelp }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// Once the local rule's filtering still leaves more than ~10 uncited
+// candidates, listing every one individually is exactly the noise problem
+// this filtering exists to fix — grouped by why each was flagged instead,
+// collapsed by default so the reader chooses which bucket to actually dig
+// into rather than scrolling past all of them.
+function UncitedGroup({ category, claims, suggestions, review, onMine, onHelp }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <button onClick={() => setOpen(v => !v)} style={{
+        width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+        background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 18px',
+        color: C.text, cursor: 'pointer', fontSize: 13.5, fontWeight: 600,
+      }}>
+        <span>{UNCITED_CATEGORY_LABEL[category] || category} ({claims.length})</span>
+        {open ? <ChevronUp size={15} color={C.muted} /> : <ChevronDown size={15} color={C.muted} />}
+      </button>
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {claims.map(({ claim, i }) => (
+            <UncitedClaimCard
+              key={i} claim={claim} suggestion={suggestions[i]} review={review[i]}
+              onMine={() => onMine(i)} onHelp={() => onHelp(i)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// "X of Y cited sources found in corpus," which sources were never uploaded
+// (the reason a whole cluster of claims can go UNSUPPORTED with nothing
+// wrong with the paper itself), and which uploaded sources look unreliable
+// to search against (slide-deck-shaped PDFs, or ones with almost no
+// extractable text layer) — see extractText.js's quality check and
+// sourceCoverage.js's computeSourceCoverage/tagUnsupportedClaims.
+function SourceCoveragePanel({ coverage, extractionWarnings, referencesInfo }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: '20px 24px', marginBottom: 28 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 12 }}>
+        Source Coverage
+      </div>
+      <div style={{ fontSize: 13.5, color: C.text, marginBottom: referencesInfo.found ? 6 : 0 }}>
+        {coverage.foundCount} of {coverage.total} cited sources found in corpus
+      </div>
+      {referencesInfo.found && (
+        <div style={{ fontSize: 12.5, color: C.muted }}>
+          {referencesInfo.entryCount} reference entries identified and excluded from verification.
+        </div>
+      )}
+      {coverage.missing.length > 0 && (
+        <div style={{ marginTop: 14, borderLeft: `2px solid ${C.amber}55`, paddingLeft: 14 }}>
+          <div style={{ fontSize: 13, color: '#FBBF24', lineHeight: 1.6, marginBottom: 6 }}>
+            The following cited sources were not found in the verification corpus:
+          </div>
+          <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, color: C.muted, lineHeight: 1.8 }}>
+            {coverage.missing.map((m, i) => <li key={i}>{m.raw}</li>)}
+          </ul>
+          <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>
+            Upload these before re-running for a reliable score.
+          </div>
+        </div>
+      )}
+      {extractionWarnings.length > 0 && (
+        <div style={{ marginTop: 14, borderLeft: `2px solid ${C.red2}55`, paddingLeft: 14 }}>
+          <div style={{ fontSize: 13, color: C.red, lineHeight: 1.6, marginBottom: 6 }}>
+            Sources with extraction warnings:
+          </div>
+          {extractionWarnings.map((name, i) => (
+            <div key={i} style={{ fontSize: 12.5, color: C.muted, lineHeight: 1.6, marginBottom: 4 }}>
+              <b style={{ color: C.text }}>{name}</b> may have limited text extractability (slide-deck or scanned
+              format). Claims citing this source may be marked UNSUPPORTED due to extraction limitations rather
+              than genuine absence from the source.
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -658,6 +797,23 @@ function Footer() {
         you choose, and we never see or keep a copy of it. You're responsible for that provider's own usage,
         costs, and terms.
       </div>
+
+      <div style={{
+        maxWidth: 460, margin: '0 auto 20px', background: C.card, border: `1px solid ${C.border}`,
+        borderRadius: 10, padding: '14px 18px', fontSize: 12, color: C.muted, lineHeight: 1.65, textAlign: 'left',
+      }}>
+        Once your citations check out, the next question is usually where to submit. <a
+          href="https://scilene-25055279a542.herokuapp.com/" target="_blank" rel="noopener noreferrer"
+          style={{ color: C.teal, textDecoration: 'none', fontWeight: 700 }}
+        >Scilene</a> — a companion tool from the same author — matches your manuscript against journals indexed
+        in Scopus, Web of Science, DOAJ, and SINTA, with a plain-language explanation for why each one fits.
+        Same approach as here: no account, runs locally.{' '}
+        <a href="https://github.com/YasirM0/Scilene" target="_blank" rel="noopener noreferrer"
+           style={{ color: C.teal, textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+          Source on GitHub <ExternalLink size={11} />
+        </a>
+      </div>
+
       <div style={{ fontSize: 11.5, color: C.muted, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
         <span>Built by</span>
         <a href="https://github.com/YasirM0" target="_blank" rel="noopener noreferrer" style={{ color: C.teal, textDecoration: 'none' }}>
@@ -1060,7 +1216,12 @@ export default function Loupe() {
 
   const runChunked = async resumeFrom => {
     const text = paperTxt.trim() || paper?.content || paper?.text || '';
-    const chunks = resumeFrom?.chunks || chunkText(text);
+    // The References section adds nothing to check and wastes both tokens
+    // and the LLM's claim-slots on bibliography entries — only the body
+    // (everything before it) gets chunked and sent; the full `text` is still
+    // what's saved/restored for the paper-editing UI and what buildFinalResult
+    // uses to report on the section it found.
+    const chunks = resumeFrom?.chunks || chunkText(splitReferencesSection(text).body);
     let cited = resumeFrom?.citedClaims || [];
     let uncited = resumeFrom?.uncitedClaims || [];
     let contradictions = resumeFrom?.contradictions || [];
@@ -1130,7 +1291,7 @@ export default function Loupe() {
       saveProgress({ chunks, chunkIndex: i, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, paperTxt: text, refs });
     }
 
-    setResult(buildFinalResult(cited, uncited, contradictions));
+    setResult(buildFinalResult(cited, uncited, contradictions, refs, text));
     clearProgress();
     setLoading(false);
     setLiveChunk(null);
@@ -1161,7 +1322,12 @@ export default function Loupe() {
           })
         : Promise.resolve({ contradictions: [] });
       const [verdict, cv] = await Promise.all([claimCall, contraCall]);
-      setResult(buildFinalResult(verdict.citedClaims || [], verdict.uncitedClaims || [], cv.contradictions || []));
+      // Anthropic reads the PDF's raw bytes natively, so the References
+      // section can't be stripped out of what's actually sent here — only
+      // out of the separately pdfjs-extracted `paper.text`, which is used
+      // below purely for reporting (entry count, source coverage), not
+      // re-sent to the model.
+      setResult(buildFinalResult(verdict.citedClaims || [], verdict.uncitedClaims || [], cv.contradictions || [], refs, paper?.text || ''));
     } catch (e) { setErr('Verification failed: ' + e.message); }
     finally { setLoading(false); setRunStatus(''); }
   };
@@ -1175,11 +1341,9 @@ export default function Loupe() {
     setActiveFilter('ALL'); setUncitedReview({});
     const worker = getWorker();
     const paperText = paper?.text || paperTxt.trim();
-    const allClaims = extractClaims(paperText);
+    const allClaims = extractClaims(splitReferencesSection(paperText).body);
     const citedCandidates = allClaims.filter(c => c.hasCitation);
-    const uncitedClaims = allClaims
-      .filter(c => c.autoSelected && !c.hasCitation)
-      .map(c => ({ claim: c.text, note: 'Flagged by local rules (number, comparison, or reasoning verb) — no citation attached.' }));
+    const uncitedClaims = extractUncitedClaims(allClaims);
 
     const onMessage = (resolveType, onMsg) => new Promise((resolve, reject) => {
       const handler = e => {
@@ -1236,7 +1400,7 @@ export default function Loupe() {
       worker.postMessage({ type: 'VERIFY', claims: citedCandidates, retrievalMethod });
       await verified;
 
-      setResult(buildFinalResult(citedClaims, uncitedClaims, contradictions));
+      setResult(buildFinalResult(citedClaims, uncitedClaims, contradictions, refs, paperText));
     } catch (e) {
       setErr('Verification failed: ' + e.message);
     } finally {
@@ -1288,8 +1452,20 @@ export default function Loupe() {
   const buildReportText = () => {
     if (!result) return '';
     const lines = [
-      `LOUPE — SOURCE VERIFICATION REPORT`, `Score: ${result.score}/100`, ``, result.summary, ``,
+      `LOUPE — SOURCE VERIFICATION REPORT`,
+      `Raw score: ${result.rawScore}/100   Adjusted score: ${result.score}/100`,
+      `Source coverage: ${result.sourceCoverage.foundCount} of ${result.sourceCoverage.total} cited sources found in corpus`,
     ];
+    if (result.extractionWarnings.length) lines.push(`Sources with extraction warnings: ${result.extractionWarnings.join(', ')}`);
+    if (result.referencesInfo.found) lines.push(`References section: ${result.referencesInfo.entryCount} entries identified and excluded from verification.`);
+    lines.push('', result.summary, '');
+
+    if (result.sourceCoverage.missing.length) {
+      lines.push(`SOURCE COVERAGE`);
+      lines.push(`The following cited sources were not found in the verification corpus: ${result.sourceCoverage.missing.map(m => m.raw).join('; ')}.`);
+      lines.push(`Upload these before re-running for a reliable score.`, '');
+    }
+
     if (result.contradictions.length) {
       lines.push(`CONTRADICTIONS`);
       lines.push(...result.contradictions.map(c => `[CONTRADICTED] ${c.claim}\n  "${c.evidence}"\n  ${c.explanation}\n  Source: ${c.source}`));
@@ -1297,10 +1473,10 @@ export default function Loupe() {
     }
     lines.push(`CITED CLAIMS`);
     lines.push(...result.citedClaims.map(c =>
-      `[${c.status}] ${c.claim}${c.citation ? ' ' + c.citation : ''}\n  Evidence: "${c.evidence}"\n  ${c.explanation}${c.source && c.source !== 'none' ? '\n  Source: ' + c.source : ''}`
+      `[${c.status}${c.unsupportedReason ? ' · ' + UNSUPPORTED_REASON_LABEL[c.unsupportedReason] : ''}] ${c.claim}${c.citation ? ' ' + c.citation : ''}\n  Evidence: "${c.evidence}"\n  ${c.explanation}${c.source && c.source !== 'none' ? '\n  Source: ' + c.source : ''}`
     ));
     lines.push('', `CLAIMS WITHOUT A CITATION`);
-    lines.push(...result.uncitedClaims.map(c => `- ${c.claim}${c.note ? '\n  ' + c.note : ''}`));
+    lines.push(...result.uncitedClaims.map(c => `- [${c.category}] ${c.claim}${c.note ? '\n  ' + c.note : ''}`));
     return lines.join('\n');
   };
 
@@ -1332,7 +1508,7 @@ export default function Loupe() {
   const estChunks = isChunkable ? chunkText(paperText).length : 1;
   const browserPaperText = paper?.text || paperTxt.trim();
   const browserClaimEstimate = providerInfo.kind === 'browser' && browserPaperText
-    ? extractClaims(browserPaperText).filter(c => c.hasCitation).length
+    ? extractClaims(splitReferencesSection(browserPaperText).body).filter(c => c.hasCitation).length
     : 0;
   const estCalls  = estChunks * (huntContradictions ? 2 : 1);
   const isPaused  = progress && progress.chunkIndex < progress.chunks?.length;
@@ -1616,10 +1792,13 @@ export default function Loupe() {
 
         {result && (
           <div className="results">
-            <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 14, padding: '32px 36px', marginBottom: 36, display: 'flex', gap: 34, alignItems: 'center', flexWrap: 'wrap' }}>
+            <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 14, padding: '32px 36px', marginBottom: 24, display: 'flex', gap: 34, alignItems: 'center', flexWrap: 'wrap' }}>
               <ScoreSeal score={result.score} />
               <div style={{ flex: 1, minWidth: 240 }}>
-                <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10 }}>Citation Accuracy Score</div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <span>Citation Accuracy Score (adjusted)</span>
+                  <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: C.muted }}>Raw score: {result.rawScore}/100</span>
+                </div>
                 <div style={{ fontSize: 15, color: C.text, lineHeight: 1.75 }}>{result.summary}</div>
                 <div style={{ display: 'flex', gap: 20, marginTop: 18, flexWrap: 'wrap' }}>
                   {['SUPPORTED', 'PARTIAL', 'UNSUPPORTED', 'CONTRADICTED'].map(s => {
@@ -1641,6 +1820,8 @@ export default function Loupe() {
                 </div>
               </div>
             </div>
+
+            <SourceCoveragePanel coverage={result.sourceCoverage} extractionWarnings={result.extractionWarnings} referencesInfo={result.referencesInfo} />
 
             {result.contradictions.length > 0 && (
               <>
@@ -1672,14 +1853,31 @@ export default function Loupe() {
                 <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, marginBottom: 16 }}>
                   Not checked against your sources — review these yourself to confirm they're your own analysis.
                 </div>
-                {result.uncitedClaims.map((c, i) => (
-                  <UncitedClaimCard
-                    key={i} claim={c} suggestion={uncitedSuggestions[i]}
-                    review={uncitedReview[i]}
-                    onMine={() => setUncitedReview(prev => ({ ...prev, [i]: 'own' }))}
-                    onHelp={() => setUncitedReview(prev => ({ ...prev, [i]: 'shown' }))}
-                  />
-                ))}
+                {result.uncitedClaims.length <= 10 ? (
+                  result.uncitedClaims.map((c, i) => (
+                    <UncitedClaimCard
+                      key={i} claim={c} suggestion={uncitedSuggestions[i]}
+                      review={uncitedReview[i]}
+                      onMine={() => setUncitedReview(prev => ({ ...prev, [i]: 'own' }))}
+                      onHelp={() => setUncitedReview(prev => ({ ...prev, [i]: 'shown' }))}
+                    />
+                  ))
+                ) : (
+                  ['STATISTIC', 'COMPARATIVE', 'INTERPRETIVE'].map(category => {
+                    const claims = result.uncitedClaims
+                      .map((claim, i) => ({ claim, i }))
+                      .filter(({ claim }) => claim.category === category);
+                    if (!claims.length) return null;
+                    return (
+                      <UncitedGroup
+                        key={category} category={category} claims={claims}
+                        suggestions={uncitedSuggestions} review={uncitedReview}
+                        onMine={i => setUncitedReview(prev => ({ ...prev, [i]: 'own' }))}
+                        onHelp={i => setUncitedReview(prev => ({ ...prev, [i]: 'shown' }))}
+                      />
+                    );
+                  })
+                )}
               </>
             )}
 
