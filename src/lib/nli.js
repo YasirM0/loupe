@@ -129,3 +129,40 @@ export function applyDominantSupportGuard(status, agg) {
   if (s >= 0.55 && s > 2 * c && s > 2 * u) return 'SUPPORTED';
   return status;
 }
+
+// Mirror of applyDominantSupportGuard for the opposite failure mode: a
+// contradiction score that's clearly dominant but stops just short of the
+// fixed 0.75 CONTRADICTED cutoff, landing in UNSUPPORTED — "evidence doesn't
+// address this" — when the evidence actually does address it and disagrees.
+// A larger adversarial stress test (bench/stress-run.mjs, paragraph-level,
+// full retrieval+NLI pipeline, not isolated pairs) surfaced this repeatedly:
+// numeric-mismatch and explicit-negation claims scoring contradicted=0.63-
+// 0.75 with supported<0.1, called UNSUPPORTED purely because 0.75 wasn't
+// cleared.
+//
+// Same thresholds as applyDominantSupportGuard (0.55 floor, 2x the other two
+// scores) rather than a looser one — simulated first against real captured
+// scores from both NLI_TESTSET/ID_NLI_TESTSET (the authoritative regression
+// check, ID_NLI_TESTSET run through opus-mt-id-en first, matching production)
+// and the stress set before shipping. Result: zero changes at all on either
+// official 14-case test set (12/14 -> 12/14 for both), and a net accuracy
+// gain on the harder stress set in both languages (bench/stress-run.mjs:
+// English 45%->64%, Indonesian's one fix and one collateral case cancel out
+// at 55%), at the cost of one known, narrow collateral pattern also present
+// on the support side of this same guard shape: a claim about a topic the
+// source explicitly didn't cover can still score contradicted-dominant from
+// vocabulary/topic overlap alone, flipping a correct UNSUPPORTED into a false CONTRADICTED
+// ("absence on an adjacent topic" in the stress set). This is a materially
+// different risk profile than the broader "any moderately-dominant
+// contradiction" idea already tried and rejected elsewhere in this file —
+// that one broke the single most important trap case (a fabrication wearing
+// a real author's name, correctly UNSUPPORTED); this guard's one measured
+// collateral case is a real-but-uncited-scope-gap, not a citation-fraud
+// case slipping through, and the official test suites show no regression at
+// all from it.
+export function applyDominantContradictionGuard(status, agg) {
+  if (status !== 'UNSUPPORTED') return status;
+  const { supported: s, contradicted: c, unrelated: u } = agg;
+  if (c >= 0.55 && c > 2 * s && c > 2 * u) return 'CONTRADICTED';
+  return status;
+}

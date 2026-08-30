@@ -10,7 +10,7 @@
 // build only supports cuda/webgpu/cpu (no 'wasm', unlike the browser build
 // the worker uses); cpu is the only one guaranteed to run everywhere.
 import { pipeline, env } from '@huggingface/transformers';
-import { classifyPair, verdictFromScores, applyNumericGuard, applyNegationGuard, applyDominantSupportGuard } from '../src/lib/nli.js';
+import { classifyPair, verdictFromScores, applyNumericGuard, applyNegationGuard, applyDominantSupportGuard, applyDominantContradictionGuard } from '../src/lib/nli.js';
 import { translateIdToEn } from '../src/lib/dictionary.id-en.js';
 import { NLI_TESTSET, RETRIEVAL_TESTSET, ID_NLI_TESTSET, ID_RETRIEVAL_TESTSET, AR_NLI_TESTSET, AR_RETRIEVAL_TESTSET } from './testset.mjs';
 
@@ -39,6 +39,7 @@ async function benchNli(modelId, { testset = NLI_TESTSET, preprocess = t => t, l
     let { status } = verdictFromScores(scores, 1.0);
     status = applyNumericGuard(status, claim, evidence);
     status = applyDominantSupportGuard(status, scores);
+    status = applyDominantContradictionGuard(status, scores);
     status = applyNegationGuard(status, claim, scores);
     const ok = status === item.expected;
     if (ok) correct++;
@@ -341,3 +342,22 @@ console.log(JSON.stringify(arResults, null, 2));
 // hold up against English; they didn't, so it isn't in Loupe.jsx's
 // LANGUAGES list — this was an if/then already agreed before running the
 // numbers, not a judgment call made after seeing them.
+
+// bench/stress-run.mjs (2026-08-31): a separate, larger adversarial test —
+// 4 full source documents, 12 claims, run through the actual chunking +
+// retrieval + NLI pipeline rather than isolated pairs — found English and
+// Indonesian both scoring far below the official 14-case set (45%/55% vs.
+// 79%/86%), as expected for a deliberately harder test, but the misses
+// weren't language-specific: most traced to one gap in verdictFromScores,
+// which promoted a dominant-but-under-0.75 *supported* score
+// (applyDominantSupportGuard) but had no equivalent for a dominant-but-
+// under-0.75 *contradicted* score. applyDominantContradictionGuard in
+// src/lib/nli.js fixes that, mirroring the support guard's exact thresholds.
+// Simulated against real captured scores before shipping (see that
+// function's comment for the full reasoning): zero changes on either
+// official 14-case test set (12/14 -> 12/14 for both EN and ID, the latter
+// through opus-mt-id-en to match production), and a net gain on the stress
+// set (English 45%->64%; Indonesian's one fix and one new collateral case
+// cancel out at 55%, unchanged). Re-run bench/stress-run.mjs after any
+// future guard or model change touching this file — it catches failure
+// modes the small official set, by design, doesn't have room to cover.
