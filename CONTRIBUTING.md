@@ -25,7 +25,7 @@ The grounding rules live in `ABSOLUTE_RULES`, shared between the claim-checking 
 
 ## Deployment
 
-Every push to `main` rebuilds and redeploys the live site at [yasirm0.github.io/loupe](https://yasirm0.github.io/loupe/) via [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) — there's no separate staging step or manual publish. Treat `main` accordingly: it's meant to always be in a working, verifiable state, not a place to land half-finished changes.
+Every push to `main` rebuilds and redeploys the live site at [loupe.yasirmo.me](https://loupe.yasirmo.me/) via [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) — there's no separate staging step or manual publish. Treat `main` accordingly: it's meant to always be in a working, verifiable state, not a place to land half-finished changes.
 
 The desktop app is separate and doesn't auto-publish — pushing a `v*` tag builds installers via [`.github/workflows/release.yml`](.github/workflows/release.yml) into a draft [GitHub Release](https://github.com/YasirM0/loupe/releases) that still needs a maintainer to review and publish.
 

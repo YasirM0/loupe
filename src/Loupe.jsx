@@ -803,7 +803,7 @@ function Footer() {
         borderRadius: 10, padding: '14px 18px', fontSize: 12, color: C.muted, lineHeight: 1.65, textAlign: 'left',
       }}>
         Once your citations check out, the next question is usually where to submit. <a
-          href="https://scilene-25055279a542.herokuapp.com/" target="_blank" rel="noopener noreferrer"
+          href="https://scilene.yasirmo.me/" target="_blank" rel="noopener noreferrer"
           style={{ color: C.teal, textDecoration: 'none', fontWeight: 700 }}
         >Scilene</a> — a companion tool from the same author — matches your manuscript against journals indexed
         in Scopus, Web of Science, DOAJ, and SINTA, with a plain-language explanation for why each one fits.

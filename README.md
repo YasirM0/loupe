@@ -4,7 +4,7 @@
 
 No account, no upload to a third-party server, no internet search. It's a citation-accuracy checker and reference-verification tool for anyone who needs to sanity-check a paper, literature review, thesis chapter, or AI-assisted draft before it goes out the door: authors, reviewers, editors, and students.
 
-**[Try it now — yasirm0.github.io/loupe](https://yasirm0.github.io/loupe/)**, no install. See [Using it](#using-it) for the local-dev and desktop-app options too.
+**[Try it now — loupe.yasirmo.me](https://loupe.yasirmo.me/)**, no install. See [Using it](#using-it) for the local-dev and desktop-app options too.
 
 > If you searched "Loupe" and landed here expecting a jeweler's magnifying glass — that's exactly where the name comes from. This is that same idea of close, careful examination, applied to a paper's citations.
 
@@ -74,7 +74,7 @@ Three ways to run Loupe, from least to most setup. All three are the same app �
 
 ### 1. Open it in a browser — no install
 
-**[yasirm0.github.io/loupe](https://yasirm0.github.io/loupe/)** — the live build of this repo's `main` branch, deployed automatically by [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) on every push. Nothing to clone, install, or build; it's the same static site the other two options below produce, just already running. Bookmark it or add it to your phone/desktop home screen like any other web page — it stays a normal browser tab, updating with the repo, and everything in [Privacy](#privacy--read-this-first) still applies (nothing is uploaded to us; it just serves the page).
+**[loupe.yasirmo.me](https://loupe.yasirmo.me/)** — the live build of this repo's `main` branch, deployed automatically by [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) on every push (served via GitHub Pages on a custom domain). Nothing to clone, install, or build; it's the same static site the other two options below produce, just already running. Bookmark it or add it to your phone/desktop home screen like any other web page — it stays a normal browser tab, updating with the repo, and everything in [Privacy](#privacy--read-this-first) still applies (nothing is uploaded to us; it just serves the page).
 
 ### 2. Run it from source
 
@@ -127,7 +127,7 @@ Chunking means more API calls than a single-shot summary would — each chunk re
 
 **Can I use it without an API key?** You need a key (or a running local model) for whichever provider you pick — Loupe itself doesn't include or proxy any AI access.
 
-**Does it work offline?** Verification itself does, once the local models are cached — no network call happens during checking, whether you're on the hosted site, running from source, or using the desktop app. What differs is loading the app the very first time on a given browser/device: the desktop app is a bundled binary, so it opens with zero connectivity from the start (only the model download needs internet, once). The browser build ([yasirm0.github.io/loupe](https://yasirm0.github.io/loupe/)) needs one successful page load before it can be reopened offline, since there's no service worker forcing the app shell into a persistent cache — after that first visit, your browser's own cache is what makes reopening it offline work. Either way, switching to an API-key provider (or Local AI pointed at a server that isn't actually running) always needs a live connection, whether that's the internet or a local server on your own machine.
+**Does it work offline?** Verification itself does, once the local models are cached — no network call happens during checking, whether you're on the hosted site, running from source, or using the desktop app. What differs is loading the app the very first time on a given browser/device: the desktop app is a bundled binary, so it opens with zero connectivity from the start (only the model download needs internet, once). The browser build ([loupe.yasirmo.me](https://loupe.yasirmo.me/)) needs one successful page load before it can be reopened offline, since there's no service worker forcing the app shell into a persistent cache — after that first visit, your browser's own cache is what makes reopening it offline work. Either way, switching to an API-key provider (or Local AI pointed at a server that isn't actually running) always needs a live connection, whether that's the internet or a local server on your own machine.
 
 ## Contributing
 
