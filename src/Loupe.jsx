@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 import { Upload, BookOpen, FileText, Trash2, CheckCircle,
          AlertCircle, XCircle, Loader, Copy, Settings, X, ArrowLeft,
-         Download, AlertTriangle, ShieldCheck, ExternalLink, ChevronDown, ChevronUp } from "lucide-react";
+         Download, AlertTriangle, ShieldCheck, ExternalLink, ChevronDown, ChevronUp, Globe } from "lucide-react";
 import { extractPdfText, extractDocxText } from "./lib/extractText.js";
 import { chunkReferenceIntoSentences, extractClaims, extractUncitedClaims,
          splitReferencesSection, categorizeUncitedClaim } from "./lib/textProcessing.js";
@@ -986,7 +986,7 @@ function LocalAiFields({ baseUrl, model, apiKey, huntContradictions, onBaseUrl, 
 }
 
 function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, providerInfo, t,
-                          embedModel, nliModel, retrievalMethod, customProviderName, lang, LANGUAGES, onLang,
+                          embedModel, nliModel, retrievalMethod, customProviderName,
                           onProvider, onBaseUrl, onModel, onApiKey, onToggleHunt, onClose,
                           onEmbedModel, onNliModel, onRetrieval, onCustomProviderName }) {
   const [showApiProviders, setShowApiProviders] = useState(
@@ -1013,13 +1013,6 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div>
-            <div style={fieldLabelStyle}>Language / Bahasa</div>
-            <select value={lang} onChange={e => onLang(e.target.value)} style={inputStyle}>
-              {LANGUAGES.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
-            </select>
-          </div>
-
           <div>
             <div style={fieldLabelStyle}>{t.provider}</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -1602,6 +1595,15 @@ export default function Loupe() {
               <Download size={13} /> {t.downloadReport}
             </button>
           )}
+          <label title={t.languageTooltip} style={{ ...ghostBtnStyle, cursor: 'pointer' }}>
+            <Globe size={14} />
+            <select
+              value={lang} onChange={e => handleLang(e.target.value)}
+              style={{ background: 'none', border: 'none', color: C.muted, fontSize: 12.5, cursor: 'pointer', outline: 'none' }}
+            >
+              {LANGUAGES.map(l => <option key={l.id} value={l.id} style={{ background: C.panel, color: C.text }}>{l.label}</option>)}
+            </select>
+          </label>
           <button onClick={() => setShowSettings(true)} title={t.settingsTooltip} style={ghostBtnStyle}>
             <Settings size={14} />
             <span>
@@ -1617,7 +1619,7 @@ export default function Loupe() {
           provider={provider} baseUrl={baseUrl} model={model} apiKey={apiKey} t={t}
           huntContradictions={huntContradictions} providerInfo={providerInfo}
           embedModel={embedModel} nliModel={nliModel} retrievalMethod={retrievalMethod}
-          customProviderName={customProviderName} lang={lang} LANGUAGES={LANGUAGES} onLang={handleLang}
+          customProviderName={customProviderName}
           onProvider={handleProvider} onBaseUrl={handleBaseUrl} onModel={handleModel}
           onApiKey={handleApiKey} onToggleHunt={toggleHunt}
           onEmbedModel={handleEmbedModel} onNliModel={handleNliModel} onRetrieval={handleRetrieval}

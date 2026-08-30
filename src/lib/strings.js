@@ -23,6 +23,7 @@ const en = {
   downloadReport: 'Download report',
   checkingWith: 'Checking with: ',
   settingsTooltip: 'Change what checks your claims — model, provider, or API key',
+  languageTooltip: 'Interface and check language',
 
   // ── Setup screen ──
   setupTitle: "Verify your paper's claims",
@@ -222,6 +223,7 @@ const id = {
   downloadReport: 'Unduh laporan',
   checkingWith: 'Memeriksa dengan: ',
   settingsTooltip: 'Ubah apa yang memeriksa klaim Anda — model, penyedia, atau kunci API',
+  languageTooltip: 'Bahasa antarmuka dan pemeriksaan',
 
   // ── Setup screen ──
   setupTitle: 'Verifikasi klaim makalah Anda',
