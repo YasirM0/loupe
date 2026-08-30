@@ -8,10 +8,18 @@ import { splitReferenceEntries, findAllCitations } from './textProcessing.js';
 // heuristic cross-check against an uploaded corpus with no structured
 // metadata of its own. Both callers below share this so a reference-list
 // entry and its in-text citation resolve to the same key.
+// Strips the lead-in phrase from textProcessing.js's SIGNAL_BARE_CITATION
+// style ("According to Smith, 2020" / "Per Smith, 2020") before hunting for
+// the surname — without this, "According"/"Per" (both capitalized, both
+// ahead of the year) get picked up as the name instead of the actual author,
+// which silently breaks matching for that citation style specifically.
+const LEAD_IN = /^\(?\s*(according\s+to|per)\s+/i;
+
 export function extractCitationKey(text) {
-  const yearMatch = text.match(/\b(\d{4})[a-z]?\b/);
+  const stripped = text.replace(LEAD_IN, '');
+  const yearMatch = stripped.match(/\b(\d{4})[a-z]?\b/);
   if (!yearMatch) return null;
-  const before = text.slice(0, yearMatch.index);
+  const before = stripped.slice(0, yearMatch.index);
   const nameMatch = before.match(/[A-Z][a-zA-Z'-]{2,}/);
   if (!nameMatch) return null;
   return `${nameMatch[0].toLowerCase()}-${yearMatch[1]}`;
