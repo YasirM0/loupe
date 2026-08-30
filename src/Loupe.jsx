@@ -7,6 +7,18 @@ import { chunkReferenceIntoSentences, extractClaims, extractUncitedClaims,
          splitReferencesSection, categorizeUncitedClaim } from "./lib/textProcessing.js";
 import { tagUnsupportedClaims, computeAdjustedScore, computeSourceCoverage } from "./lib/sourceCoverage.js";
 import { BM25Index } from "./lib/bm25.js";
+import { stringsFor } from "./lib/strings.js";
+
+// Languages the UI itself offers a toggle for — gated on the local
+// pipeline actually measuring comparable quality to English (see
+// bench/run.mjs's 2026-08-30 comparison and strings.js's header comment).
+// Arabic isn't listed here even though textProcessing.js already carries
+// lexicon/citation-pattern groundwork for it — its own benchmark run is
+// what decides whether it's added, not a guess.
+const LANGUAGES = [
+  { id: 'en', label: 'English' },
+  { id: 'id', label: 'Bahasa Indonesia' },
+];
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -26,11 +38,14 @@ const C = {
   red2:    '#dc2626',
 };
 
-const STATUS = {
-  SUPPORTED:    { col: C.green,  bg: C.greenBg, label: 'Supported',    Icon: CheckCircle  },
-  PARTIAL:      { col: C.amber,  bg: C.amberBg, label: 'Partial',      Icon: AlertCircle  },
-  UNSUPPORTED:  { col: C.red,    bg: C.redBg,   label: 'No source',    Icon: XCircle      },
-  CONTRADICTED: { col: C.red2,   bg: C.redBg,   label: 'Contradicted', Icon: XCircle      },
+// Built per-render from the active `t` (see buildStatusMaps below) rather
+// than kept as a module-level const, since the label text now varies with
+// the language toggle — colors/icons don't, so those stay fixed here.
+const STATUS_META = {
+  SUPPORTED:    { col: C.green,  bg: C.greenBg, Icon: CheckCircle  },
+  PARTIAL:      { col: C.amber,  bg: C.amberBg, Icon: AlertCircle  },
+  UNSUPPORTED:  { col: C.red,    bg: C.redBg,   Icon: XCircle      },
+  CONTRADICTED: { col: C.red2,   bg: C.redBg,   Icon: XCircle      },
 };
 
 const CONFIDENCE = {
@@ -39,18 +54,28 @@ const CONFIDENCE = {
   LOW:    C.muted,
 };
 
-// Why an UNSUPPORTED verdict came back UNSUPPORTED — see sourceCoverage.js's
-// tagUnsupportedClaims, which is what actually assigns unsupportedReason.
-const UNSUPPORTED_REASON_LABEL = {
-  SOURCE_NOT_UPLOADED: 'SOURCE NOT UPLOADED',
-  EXTRACTION_LIMITED: 'EXTRACTION LIMITED',
-  NOT_FOUND_IN_SOURCE: 'NOT FOUND IN SOURCE',
-};
-const UNCITED_CATEGORY_LABEL = {
-  STATISTIC: 'Statistics without citation',
-  COMPARATIVE: 'Comparative claims without citation',
-  INTERPRETIVE: 'Interpretive claims flagged by rule',
-};
+// Assembles the three language-dependent label maps from `t` in one place
+// — every component below that needs a status/reason/category label takes
+// the relevant map as a prop instead of importing a fixed English object.
+function buildStatusMaps(t) {
+  const STATUS = {
+    SUPPORTED:    { ...STATUS_META.SUPPORTED,    label: t.statusSupported },
+    PARTIAL:      { ...STATUS_META.PARTIAL,      label: t.statusPartial },
+    UNSUPPORTED:  { ...STATUS_META.UNSUPPORTED,  label: t.statusUnsupported },
+    CONTRADICTED: { ...STATUS_META.CONTRADICTED, label: t.statusContradicted },
+  };
+  const UNSUPPORTED_REASON_LABEL = {
+    SOURCE_NOT_UPLOADED: t.unsupportedSourceNotUploaded,
+    EXTRACTION_LIMITED: t.unsupportedExtractionLimited,
+    NOT_FOUND_IN_SOURCE: t.unsupportedNotFoundInSource,
+  };
+  const UNCITED_CATEGORY_LABEL = {
+    STATISTIC: t.categoryStatistic,
+    COMPARATIVE: t.categoryComparative,
+    INTERPRETIVE: t.categoryInterpretive,
+  };
+  return { STATUS, UNSUPPORTED_REASON_LABEL, UNCITED_CATEGORY_LABEL };
+}
 
 // ── Providers ─────────────────────────────────────────────────────────────────
 // Ordered by how they're presented in Settings: recommended local-only path
@@ -359,24 +384,27 @@ async function callLLM({ kind, apiKey, baseUrl, model, parts, instructions, onRe
 // Kept exactly as before — still used standalone by LiveProgressPanel for
 // the in-progress stats strip, which has no refs/paper-text context handy
 // and doesn't need the reason-aware adjusted score, just running counts.
-function summarize(cited, uncited, contradictions) {
+// `t` defaults to English so the (rare) caller that doesn't have it handy
+// still works — LiveProgressPanel passes the active one through.
+function summarize(cited, uncited, contradictions, t = stringsFor('en')) {
   const counts = { SUPPORTED: 0, PARTIAL: 0, UNSUPPORTED: 0, CONTRADICTED: 0 };
   cited.forEach(c => { if (counts[c.status] !== undefined) counts[c.status]++; });
   const total = cited.length;
   const score = total ? Math.round(100 * (counts.SUPPORTED + 0.5 * counts.PARTIAL) / total) : 0;
   const summary = total
-    ? `${total} cited claim${total !== 1 ? 's' : ''} checked: ${counts.SUPPORTED} supported, ${counts.PARTIAL} partial, ${counts.UNSUPPORTED} unsupported${counts.CONTRADICTED ? `, ${counts.CONTRADICTED} contradicted` : ''}. ${uncited.length} claim${uncited.length !== 1 ? 's' : ''} had no citation${contradictions.length ? `, and the contradiction pass flagged ${contradictions.length}.` : '.'}`
-    : 'No cited claims were found to check.';
+    ? t.reportSummary({ total, supported: counts.SUPPORTED, partial: counts.PARTIAL, unsupported: counts.UNSUPPORTED, sourceNotUploaded: 0, extractionLimited: 0, notFoundInSource: counts.UNSUPPORTED, contradicted: counts.CONTRADICTED, uncitedCount: uncited.length })
+    : t.noCitedClaims(uncited.length);
   return { score, summary, counts };
 }
 
 // `paperText` is the full, un-stripped paper text (the References section is
 // still in it) — buildFinalResult finds that section itself so it can report
 // on it (entry count, source coverage) without every caller re-deriving it.
-function buildFinalResult(cited, uncited, contradictions, refs, paperText) {
+function buildFinalResult(cited, uncited, contradictions, refs, paperText, lang = 'en', t = stringsFor(lang)) {
   const refInfo = splitReferencesSection(paperText || '');
   const tagged = tagUnsupportedClaims(cited, refs);
-  const { score: rawScore, counts } = summarize(tagged, uncited, contradictions);
+  const { counts } = summarize(tagged, uncited, contradictions, t);
+  const rawScore = tagged.length ? Math.round(100 * (counts.SUPPORTED + 0.5 * counts.PARTIAL) / tagged.length) : 0;
   const adjustedScore = computeAdjustedScore(tagged);
 
   const unsupportedBreakdown = { sourceNotUploaded: 0, extractionLimited: 0, notFoundInSource: 0 };
@@ -393,12 +421,12 @@ function buildFinalResult(cited, uncited, contradictions, refs, paperText) {
   // Uncited claims from the LLM-provider path don't carry a `category` —
   // the local rule tags one at flag-time, so this only back-fills it for
   // that path, purely for the grouped-display split below.
-  const categorizedUncited = uncited.map(c => c.category ? c : { ...c, category: categorizeUncitedClaim(c.claim) });
+  const categorizedUncited = uncited.map(c => c.category ? c : { ...c, category: categorizeUncitedClaim(c.claim, lang) });
 
   const total = tagged.length;
   const summary = total
-    ? `${total} cited claim${total !== 1 ? 's' : ''} checked. ${counts.SUPPORTED} supported, ${counts.PARTIAL} partial, ${counts.UNSUPPORTED} unsupported (${unsupportedBreakdown.sourceNotUploaded} due to missing sources, ${unsupportedBreakdown.extractionLimited} due to extraction limits, ${unsupportedBreakdown.notFoundInSource} genuinely not found)${counts.CONTRADICTED ? `, ${counts.CONTRADICTED} contradicted` : ''}. ${categorizedUncited.length} sentence${categorizedUncited.length !== 1 ? 's' : ''} flagged as potentially uncited after filtering.`
-    : `No cited claims were found to check. ${categorizedUncited.length} sentence${categorizedUncited.length !== 1 ? 's' : ''} flagged as potentially uncited after filtering.`;
+    ? t.reportSummary({ total, supported: counts.SUPPORTED, partial: counts.PARTIAL, unsupported: counts.UNSUPPORTED, sourceNotUploaded: unsupportedBreakdown.sourceNotUploaded, extractionLimited: unsupportedBreakdown.extractionLimited, notFoundInSource: unsupportedBreakdown.notFoundInSource, contradicted: counts.CONTRADICTED, uncitedCount: categorizedUncited.length })
+    : t.noCitedClaims(categorizedUncited.length);
 
   return {
     citedClaims: tagged, uncitedClaims: categorizedUncited, contradictions,
@@ -425,7 +453,7 @@ function slugifyFilename(name) {
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
-function DropZone({ label, sub, multi, onFile, onFiles, flush, busy, compact }) {
+function DropZone({ label, sub, multi, onFile, onFiles, flush, busy, compact, t }) {
   const ref = useRef();
   const [isDragging, setIsDragging] = useState(false);
   const takeFiles = async files => {
@@ -464,7 +492,7 @@ function DropZone({ label, sub, multi, onFile, onFiles, flush, busy, compact }) 
         busy
           ? <div style={{ fontSize: 12.5, color: C.muted, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
               <span style={{ width: 13, height: 13, borderRadius: '50%', border: `2px solid ${C.border}`, borderTop: `2px solid ${C.teal}`, animation: 'spin 0.8s linear infinite', display: 'inline-block' }} />
-              Reading file{multi ? 's' : ''}…
+              {t.readingFiles(multi)}
             </div>
           : <span style={{ fontSize: 12.5, color: C.muted }}>+ {label}</span>
       ) : (
@@ -477,9 +505,9 @@ function DropZone({ label, sub, multi, onFile, onFiles, flush, busy, compact }) 
               ? <span style={{ width: 24, height: 24, borderRadius: '50%', border: `2.5px solid ${C.teal}33`, borderTop: `2.5px solid ${C.teal}`, animation: 'spin 0.8s linear infinite', display: 'inline-block' }} />
               : <Upload size={28} color={C.teal} />}
           </div>
-          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600 }}>{busy ? `Reading file${multi ? 's' : ''}…` : label}</div>
+          <div style={{ fontSize: 14.5, color: C.text, fontWeight: 600 }}>{busy ? t.readingFiles(multi) : label}</div>
           {!busy && sub && <div style={{ fontSize: 11.5, color: C.muted, marginTop: 5 }}>{sub}</div>}
-          {!busy && <div style={{ fontSize: 11.5, color: C.muted, marginTop: 5 }}>or drag and drop</div>}
+          {!busy && <div style={{ fontSize: 11.5, color: C.muted, marginTop: 5 }}>{t.dragAndDrop}</div>}
         </>
       )}
       <input ref={ref} type="file" accept=".txt,.docx,.pdf" multiple={!!multi} onChange={onChange} style={{ display: 'none' }} />
@@ -537,7 +565,7 @@ function ConfidenceTag({ level }) {
   );
 }
 
-function ClaimCard({ claim }) {
+function ClaimCard({ claim, STATUS, UNSUPPORTED_REASON_LABEL }) {
   const s = STATUS[claim.status] || STATUS.PARTIAL;
   return (
     <div style={{ background: C.card, border: `1px solid ${C.border}`, borderLeft: `3px solid ${s.col}`, borderRadius: 10, padding: '20px 24px', marginBottom: 14 }}>
@@ -572,7 +600,7 @@ function ClaimCard({ claim }) {
   );
 }
 
-function UncitedClaimCard({ claim, suggestion, review, onMine, onHelp }) {
+function UncitedClaimCard({ claim, suggestion, review, onMine, onHelp, t }) {
   return (
     <div style={{
       background: C.card, border: `1px dashed ${review === 'own' ? C.faint : C.border}`, borderRadius: 10,
@@ -584,7 +612,7 @@ function UncitedClaimCard({ claim, suggestion, review, onMine, onHelp }) {
           padding: '4px 9px', borderRadius: 5, letterSpacing: '0.06em', textTransform: 'uppercase',
           whiteSpace: 'nowrap', flexShrink: 0, marginTop: 2,
         }}>
-          {review === 'own' ? 'Marked as yours' : 'No citation'}
+          {review === 'own' ? t.markedAsYours : t.noCitation}
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 15, color: C.text, lineHeight: 1.6, marginBottom: 6 }}>{claim.claim}</div>
@@ -593,11 +621,11 @@ function UncitedClaimCard({ claim, suggestion, review, onMine, onHelp }) {
           {review !== 'own' && (
             <div style={{ display: 'flex', gap: 10 }}>
               <button onClick={onMine} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.muted, cursor: 'pointer', fontSize: 11.5, padding: '6px 12px' }}>
-                This is mine
+                {t.thisIsMine}
               </button>
               {suggestion && (
                 <button onClick={onHelp} style={{ background: 'none', border: `1px solid ${C.teal}55`, borderRadius: 7, color: C.teal, cursor: 'pointer', fontSize: 11.5, padding: '6px 12px' }}>
-                  Help me cite this
+                  {t.helpMeCiteThis}
                 </button>
               )}
             </div>
@@ -606,7 +634,7 @@ function UncitedClaimCard({ claim, suggestion, review, onMine, onHelp }) {
           {review === 'shown' && suggestion && (
             <div style={{ marginTop: 12, borderLeft: `2px solid ${C.faint}`, paddingLeft: 12 }}>
               <div style={{ fontSize: 11, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 5 }}>
-                Closest match in your sources — verify it yourself before citing
+                {t.closestMatch}
               </div>
               <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, fontStyle: 'italic' }}>"{suggestion.text}"</div>
               <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>→ {suggestion.source}</div>
@@ -623,7 +651,7 @@ function UncitedClaimCard({ claim, suggestion, review, onMine, onHelp }) {
 // this filtering exists to fix — grouped by why each was flagged instead,
 // collapsed by default so the reader chooses which bucket to actually dig
 // into rather than scrolling past all of them.
-function UncitedGroup({ category, claims, suggestions, review, onMine, onHelp }) {
+function UncitedGroup({ category, claims, suggestions, review, onMine, onHelp, t, UNCITED_CATEGORY_LABEL }) {
   const [open, setOpen] = useState(false);
   return (
     <div style={{ marginBottom: 14 }}>
@@ -639,7 +667,7 @@ function UncitedGroup({ category, claims, suggestions, review, onMine, onHelp })
         <div style={{ marginTop: 12 }}>
           {claims.map(({ claim, i }) => (
             <UncitedClaimCard
-              key={i} claim={claim} suggestion={suggestions[i]} review={review[i]}
+              key={i} claim={claim} suggestion={suggestions[i]} review={review[i]} t={t}
               onMine={() => onMine(i)} onHelp={() => onHelp(i)}
             />
           ))}
@@ -655,43 +683,41 @@ function UncitedGroup({ category, claims, suggestions, review, onMine, onHelp })
 // to search against (slide-deck-shaped PDFs, or ones with almost no
 // extractable text layer) — see extractText.js's quality check and
 // sourceCoverage.js's computeSourceCoverage/tagUnsupportedClaims.
-function SourceCoveragePanel({ coverage, extractionWarnings, referencesInfo }) {
+function SourceCoveragePanel({ coverage, extractionWarnings, referencesInfo, t }) {
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: '20px 24px', marginBottom: 28 }}>
       <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 12 }}>
-        Source Coverage
+        {t.sourceCoverage}
       </div>
       <div style={{ fontSize: 13.5, color: C.text, marginBottom: referencesInfo.found ? 6 : 0 }}>
-        {coverage.foundCount} of {coverage.total} cited sources found in corpus
+        {t.coverageFound(coverage.foundCount, coverage.total)}
       </div>
       {referencesInfo.found && (
         <div style={{ fontSize: 12.5, color: C.muted }}>
-          {referencesInfo.entryCount} reference entries identified and excluded from verification.
+          {t.referencesExcludedNote(referencesInfo.entryCount)}
         </div>
       )}
       {coverage.missing.length > 0 && (
         <div style={{ marginTop: 14, borderLeft: `2px solid ${C.amber}55`, paddingLeft: 14 }}>
           <div style={{ fontSize: 13, color: '#FBBF24', lineHeight: 1.6, marginBottom: 6 }}>
-            The following cited sources were not found in the verification corpus:
+            {t.missingSourcesIntro}
           </div>
           <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, color: C.muted, lineHeight: 1.8 }}>
             {coverage.missing.map((m, i) => <li key={i}>{m.raw}</li>)}
           </ul>
           <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>
-            Upload these before re-running for a reliable score.
+            {t.uploadBeforeRerun}
           </div>
         </div>
       )}
       {extractionWarnings.length > 0 && (
         <div style={{ marginTop: 14, borderLeft: `2px solid ${C.red2}55`, paddingLeft: 14 }}>
           <div style={{ fontSize: 13, color: C.red, lineHeight: 1.6, marginBottom: 6 }}>
-            Sources with extraction warnings:
+            {t.extractionWarningsIntro}
           </div>
           {extractionWarnings.map((name, i) => (
             <div key={i} style={{ fontSize: 12.5, color: C.muted, lineHeight: 1.6, marginBottom: 4 }}>
-              <b style={{ color: C.text }}>{name}</b> may have limited text extractability (slide-deck or scanned
-              format). Claims citing this source may be marked UNSUPPORTED due to extraction limitations rather
-              than genuine absence from the source.
+              {t.extractionWarningBody(name)}
             </div>
           ))}
         </div>
@@ -700,26 +726,26 @@ function SourceCoveragePanel({ coverage, extractionWarnings, referencesInfo }) {
   );
 }
 
-function FilterTabs({ result, active, onChange }) {
+function FilterTabs({ result, active, onChange, t, STATUS }) {
   const tabs = [
-    { key: 'ALL', label: 'All Claims', count: result.citedClaims.length + result.uncitedClaims.length },
+    { key: 'ALL', label: t.allClaims, count: result.citedClaims.length + result.uncitedClaims.length },
     { key: 'SUPPORTED', label: STATUS.SUPPORTED.label, count: result.counts.SUPPORTED },
     { key: 'PARTIAL', label: STATUS.PARTIAL.label, count: result.counts.PARTIAL },
     { key: 'UNSUPPORTED', label: STATUS.UNSUPPORTED.label, count: result.counts.UNSUPPORTED },
     { key: 'CONTRADICTED', label: STATUS.CONTRADICTED.label, count: result.counts.CONTRADICTED },
-    { key: 'UNCITED', label: 'Uncited', count: result.uncitedClaims.length },
-  ].filter(t => t.key === 'ALL' || t.count > 0);
+    { key: 'UNCITED', label: t.uncited, count: result.uncitedClaims.length },
+  ].filter(tab => tab.key === 'ALL' || tab.count > 0);
 
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 28 }}>
-      {tabs.map(t => (
-        <button key={t.key} onClick={() => onChange(t.key)} style={{
-          background: active === t.key ? C.teal : 'none',
-          color: active === t.key ? '#070C18' : C.muted,
-          border: `1px solid ${active === t.key ? C.teal : C.border}`,
-          borderRadius: 20, padding: '7px 16px', fontSize: 12.5, fontWeight: active === t.key ? 700 : 500, cursor: 'pointer',
+      {tabs.map(tab => (
+        <button key={tab.key} onClick={() => onChange(tab.key)} style={{
+          background: active === tab.key ? C.teal : 'none',
+          color: active === tab.key ? '#070C18' : C.muted,
+          border: `1px solid ${active === tab.key ? C.teal : C.border}`,
+          borderRadius: 20, padding: '7px 16px', fontSize: 12.5, fontWeight: active === tab.key ? 700 : 500, cursor: 'pointer',
         }}>
-          {t.label} ({t.count})
+          {tab.label} ({tab.count})
         </button>
       ))}
     </div>
@@ -755,16 +781,16 @@ function ProgressBar({ current, total }) {
 // chunked LLM runs; stays empty for the single-call whole-document path,
 // which has no intermediate signal to show). Reuses `summarize()` so the
 // numbers here are computed the exact same way as the final result.
-function LiveProgressPanel({ liveClaims }) {
+function LiveProgressPanel({ liveClaims, t }) {
   if (!liveClaims.length) return null;
-  const { counts } = summarize(liveClaims, [], []);
+  const { counts } = summarize(liveClaims, [], [], t);
   const issues = counts.UNSUPPORTED + counts.CONTRADICTED;
   const latest = liveClaims[liveClaims.length - 1];
   const stats = [
-    { label: 'Checked', value: liveClaims.length, col: C.text },
-    { label: 'Supported', value: counts.SUPPORTED, col: C.green },
-    { label: 'Partial', value: counts.PARTIAL, col: C.amber },
-    { label: 'Issues', value: issues, col: C.red },
+    { label: t.liveChecked, value: liveClaims.length, col: C.text },
+    { label: t.liveSupported, value: counts.SUPPORTED, col: C.green },
+    { label: t.livePartial, value: counts.PARTIAL, col: C.amber },
+    { label: t.liveIssues, value: issues, col: C.red },
   ];
   return (
     <div style={{ width: '100%', maxWidth: 420, display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -778,7 +804,7 @@ function LiveProgressPanel({ liveClaims }) {
       </div>
       {latest && (
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: '12px 16px' }}>
-          <div style={{ fontSize: 10.5, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Latest checked</div>
+          <div style={{ fontSize: 10.5, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>{t.latestChecked}</div>
           <div style={{ fontSize: 12.5, color: C.muted, lineHeight: 1.5, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
             {latest.claim}
           </div>
@@ -788,41 +814,36 @@ function LiveProgressPanel({ liveClaims }) {
   );
 }
 
-function Footer() {
+function Footer({ t }) {
   return (
     <footer style={{ borderTop: `1px solid ${C.border}`, padding: '32px 24px 44px', textAlign: 'center' }}>
       <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.75, maxWidth: 640, margin: '0 auto 16px' }}>
-        Everything runs in your own browser. Your paper, sources, and API key are never sent to or stored on
-        any server we run — we don't operate one. Your key goes straight from your browser to the AI provider
-        you choose, and we never see or keep a copy of it. You're responsible for that provider's own usage,
-        costs, and terms.
+        {t.privacyParagraph}
       </div>
 
       <div style={{
         maxWidth: 460, margin: '0 auto 20px', background: C.card, border: `1px solid ${C.border}`,
         borderRadius: 10, padding: '14px 18px', fontSize: 12, color: C.muted, lineHeight: 1.65, textAlign: 'left',
       }}>
-        Once your citations check out, the next question is usually where to submit. <a
+        {t.scilenePromoIntro} <a
           href="https://scilene.yasirmo.me/" target="_blank" rel="noopener noreferrer"
           style={{ color: C.teal, textDecoration: 'none', fontWeight: 700 }}
-        >Scilene</a> — a companion tool from the same author — matches your manuscript against journals indexed
-        in Scopus, Web of Science, DOAJ, and SINTA, with a plain-language explanation for why each one fits.
-        Same approach as here: no account, runs locally.{' '}
+        >Scilene</a> {t.scilenePromoBody}{' '}
         <a href="https://github.com/YasirM0/Scilene" target="_blank" rel="noopener noreferrer"
            style={{ color: C.teal, textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-          Source on GitHub <ExternalLink size={11} />
+          {t.sourceOnGithub} <ExternalLink size={11} />
         </a>
       </div>
 
       <div style={{ fontSize: 11.5, color: C.muted, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
-        <span>Built by</span>
+        <span>{t.builtBy}</span>
         <a href="https://github.com/YasirM0" target="_blank" rel="noopener noreferrer" style={{ color: C.teal, textDecoration: 'none' }}>
           Yasir Mohammed
         </a>
         <span>·</span>
         <a href="https://github.com/YasirM0/loupe" target="_blank" rel="noopener noreferrer"
            style={{ color: C.teal, textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-          Source on GitHub <ExternalLink size={11} />
+          {t.sourceOnGithub} <ExternalLink size={11} />
         </a>
       </div>
     </footer>
@@ -855,7 +876,7 @@ function ProviderCard({ selected, title, badge, desc, onClick }) {
 // URL/model instantly. An unrecognized name just becomes a custom entry —
 // someone typing their own provider's name presumably already has the
 // base URL and model in hand.
-function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, customProviderName,
+function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, customProviderName, t,
                           onProvider, onBaseUrl, onModel, onApiKey, onToggleHunt, onCustomProviderName }) {
   const startingName = API_KEY_PROVIDERS.includes(provider)
     ? PROVIDER_DEFAULTS[provider].label
@@ -881,13 +902,13 @@ function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, c
   return (
     <>
       <div>
-        <div style={fieldLabelStyle}>Provider name</div>
+        <div style={fieldLabelStyle}>{t.providerName}</div>
         <input
           value={nameInput}
           onChange={e => { setNameInput(e.target.value); setResolved(false); }}
           onBlur={commitCustom}
           onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitCustom(); } }}
-          placeholder="e.g. claude, deepseek, openrouter…"
+          placeholder={t.providerNamePlaceholder}
           style={inputStyle}
         />
         {!resolved && suggestions.length > 0 && (
@@ -904,7 +925,7 @@ function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, c
         )}
         {!resolved && nameInput.trim() && !suggestions.length && (
           <div style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
-            Not one we recognize — that's fine, click away and fill in the base URL and model yourself below.
+            {t.notRecognizedNote}
           </div>
         )}
       </div>
@@ -913,24 +934,24 @@ function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, c
         <>
           {PROVIDER_DEFAULTS[provider]?.kind !== 'anthropic' && (
             <div>
-              <div style={fieldLabelStyle}>Base URL</div>
-              <input value={baseUrl} onChange={e => onBaseUrl(e.target.value)} placeholder="e.g. https://api.example.com/v1" style={inputStyle} />
+              <div style={fieldLabelStyle}>{t.baseUrl}</div>
+              <input value={baseUrl} onChange={e => onBaseUrl(e.target.value)} placeholder={t.baseUrlPlaceholder} style={inputStyle} />
             </div>
           )}
           <div>
-            <div style={fieldLabelStyle}>Model</div>
-            <input value={model} onChange={e => onModel(e.target.value)} placeholder="Model name" style={inputStyle} />
+            <div style={fieldLabelStyle}>{t.model}</div>
+            <input value={model} onChange={e => onModel(e.target.value)} placeholder={t.modelPlaceholder} style={inputStyle} />
           </div>
           <div>
-            <div style={fieldLabelStyle}>API key</div>
-            <input type="password" value={apiKey} onChange={e => onApiKey(e.target.value)} placeholder="API key" style={inputStyle} />
+            <div style={fieldLabelStyle}>{t.apiKey}</div>
+            <input type="password" value={apiKey} onChange={e => onApiKey(e.target.value)} placeholder={t.apiKeyPlaceholder} style={inputStyle} />
           </div>
           <label style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 13, color: C.muted, cursor: 'pointer' }}>
             <input type="checkbox" checked={huntContradictions} onChange={onToggleHunt} />
-            Hunt for contradictions (separate pass, ~2× calls)
+            {t.huntContradictionsLabel}
           </label>
           <div style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.65 }}>
-            Stored only in this browser (localStorage), sent only to the base URL above.
+            {t.storedOnlyNote}
           </div>
         </>
       )}
@@ -938,34 +959,34 @@ function ApiKeySection({ provider, baseUrl, model, apiKey, huntContradictions, c
   );
 }
 
-function LocalAiFields({ baseUrl, model, apiKey, huntContradictions, onBaseUrl, onModel, onApiKey, onToggleHunt }) {
+function LocalAiFields({ baseUrl, model, apiKey, huntContradictions, onBaseUrl, onModel, onApiKey, onToggleHunt, t }) {
   return (
     <>
       <div>
-        <div style={fieldLabelStyle}>Base URL</div>
-        <input value={baseUrl} onChange={e => onBaseUrl(e.target.value)} placeholder="e.g. http://localhost:11434/v1" style={inputStyle} />
+        <div style={fieldLabelStyle}>{t.baseUrl}</div>
+        <input value={baseUrl} onChange={e => onBaseUrl(e.target.value)} placeholder={t.baseUrlLocalPlaceholder} style={inputStyle} />
       </div>
       <div>
-        <div style={fieldLabelStyle}>Model</div>
-        <input value={model} onChange={e => onModel(e.target.value)} placeholder="Model name" style={inputStyle} />
+        <div style={fieldLabelStyle}>{t.model}</div>
+        <input value={model} onChange={e => onModel(e.target.value)} placeholder={t.modelPlaceholder} style={inputStyle} />
       </div>
       <div>
-        <div style={fieldLabelStyle}>API key</div>
-        <input type="password" value={apiKey} onChange={e => onApiKey(e.target.value)} placeholder="Optional for local servers" style={inputStyle} />
+        <div style={fieldLabelStyle}>{t.apiKey}</div>
+        <input type="password" value={apiKey} onChange={e => onApiKey(e.target.value)} placeholder={t.apiKeyOptionalPlaceholder} style={inputStyle} />
       </div>
       <label style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 13, color: C.muted, cursor: 'pointer' }}>
         <input type="checkbox" checked={huntContradictions} onChange={onToggleHunt} />
-        Hunt for contradictions (separate pass, ~2× calls)
+        {t.huntContradictionsLabel}
       </label>
       <div style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.65 }}>
-        Stored only in this browser (localStorage), sent only to the base URL above.
+        {t.storedOnlyNote}
       </div>
     </>
   );
 }
 
-function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, providerInfo,
-                          embedModel, nliModel, retrievalMethod, customProviderName,
+function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, providerInfo, t,
+                          embedModel, nliModel, retrievalMethod, customProviderName, lang, LANGUAGES, onLang,
                           onProvider, onBaseUrl, onModel, onApiKey, onToggleHunt, onClose,
                           onEmbedModel, onNliModel, onRetrieval, onCustomProviderName }) {
   const [showApiProviders, setShowApiProviders] = useState(
@@ -985,7 +1006,7 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
         boxShadow: '0 24px 70px rgba(0,0,0,0.55)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 26 }}>
-          <div style={{ fontSize: 17, fontWeight: 700 }}>Connection</div>
+          <div style={{ fontSize: 17, fontWeight: 700 }}>{t.connection}</div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', padding: 4 }}>
             <X size={19} />
           </button>
@@ -993,32 +1014,39 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <div>
-            <div style={fieldLabelStyle}>Provider</div>
+            <div style={fieldLabelStyle}>Language / Bahasa</div>
+            <select value={lang} onChange={e => onLang(e.target.value)} style={inputStyle}>
+              {LANGUAGES.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
+            </select>
+          </div>
+
+          <div>
+            <div style={fieldLabelStyle}>{t.provider}</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <ProviderCard
-                selected={provider === 'browser' && !showApiProviders} badge="Recommended"
+                selected={provider === 'browser' && !showApiProviders} badge={t.recommendedBadge}
                 title={PROVIDER_DEFAULTS.browser.label}
-                desc="Runs fully in your browser. Your paper, sources, and results never leave your device — nothing is uploaded anywhere, no account needed, and it keeps working offline after the first load."
+                desc={t.browserProviderDesc}
                 onClick={() => selectTier('browser')}
               />
               <ProviderCard
                 selected={provider === 'local' && !showApiProviders}
                 title={PROVIDER_DEFAULTS.local.label}
-                desc="Point at a model server running on your own machine (e.g. Ollama) for LLM-quality reasoning without an API key — needs that server running and a bit of setup."
+                desc={t.localProviderDesc}
                 onClick={() => selectTier('local')}
               />
               <button onClick={() => setShowApiProviders(v => !v)} style={{
                 background: 'none', border: 'none', color: C.teal, cursor: 'pointer',
                 fontSize: 12, textAlign: 'left', padding: '4px 2px',
               }}>
-                {showApiProviders ? 'Hide' : 'Or bring your own API key (Claude, DeepSeek, OpenRouter…)'}
+                {showApiProviders ? t.hide : t.bringYourOwnKey}
               </button>
             </div>
           </div>
 
           {showApiProviders ? (
             <ApiKeySection
-              provider={provider} baseUrl={baseUrl} model={model} apiKey={apiKey}
+              provider={provider} baseUrl={baseUrl} model={model} apiKey={apiKey} t={t}
               huntContradictions={huntContradictions} customProviderName={customProviderName}
               onProvider={onProvider} onBaseUrl={onBaseUrl} onModel={onModel} onApiKey={onApiKey}
               onToggleHunt={onToggleHunt} onCustomProviderName={onCustomProviderName}
@@ -1026,32 +1054,32 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
           ) : provider === 'browser' ? (
             <>
               <div style={{ fontSize: 11.5, color: C.muted, lineHeight: 1.65, background: C.tealBg, border: `1px solid ${C.teal}22`, borderRadius: 8, padding: '10px 12px' }}>
-                No API key, no account, no server. Your <b>first</b> verification needs internet once, to download two small models to this browser (they're cached after that) — every verification after that runs fully offline, unless you switch to an API-key provider below, which always needs a connection. Quality is more limited than an LLM-based provider (rule-based claim detection, embedding + NLI reasoning instead of full language understanding), but there's nothing to pay for and nothing to configure. The defaults are already the best-measured options below (real test results, not a guess) — most people don't need to open "Advanced."
+                {t.browserPipelineExplainer}
               </div>
               <button onClick={() => setShowAdvanced(v => !v)} style={{
                 background: 'none', border: 'none', color: C.teal, cursor: 'pointer',
                 fontSize: 12, textAlign: 'left', padding: '4px 2px', display: 'flex', alignItems: 'center', gap: 5,
               }}>
-                {showAdvanced ? <ChevronUp size={13} /> : <ChevronDown size={13} />} Advanced model settings
+                {showAdvanced ? <ChevronUp size={13} /> : <ChevronDown size={13} />} {t.advancedModelSettings}
               </button>
               {showAdvanced && (
                 <>
                   <div>
-                    <div style={fieldLabelStyle}>Embedding model (retrieval)</div>
+                    <div style={fieldLabelStyle}>{t.embeddingModelRetrieval}</div>
                     <select value={embedModel} onChange={e => onEmbedModel(e.target.value)} style={inputStyle}>
-                      {EMBED_MODELS.map(m => <option key={m.id} value={m.id}>{m.label} — {m.size}{m.quality != null ? ` — ${m.quality}% on our test set` : ''}</option>)}
+                      {EMBED_MODELS.map(m => <option key={m.id} value={m.id}>{m.label} — {m.size}{m.quality != null ? ` — ${t.qualityOnTestSet(m.quality)}` : ''}</option>)}
                     </select>
                     <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{EMBED_MODELS.find(m => m.id === embedModel)?.desc}</div>
                   </div>
                   <div>
-                    <div style={fieldLabelStyle}>NLI model (reasoning)</div>
+                    <div style={fieldLabelStyle}>{t.nliModelReasoning}</div>
                     <select value={nliModel} onChange={e => onNliModel(e.target.value)} style={inputStyle}>
-                      {NLI_MODELS.map(m => <option key={m.id} value={m.id}>{m.label} — {m.size}{m.quality != null ? ` — ${m.quality}% on our test set` : ''}</option>)}
+                      {NLI_MODELS.map(m => <option key={m.id} value={m.id}>{m.label} — {m.size}{m.quality != null ? ` — ${t.qualityOnTestSet(m.quality)}` : ''}</option>)}
                     </select>
                     <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{NLI_MODELS.find(m => m.id === nliModel)?.desc}</div>
                   </div>
                   <div>
-                    <div style={fieldLabelStyle}>Retrieval method</div>
+                    <div style={fieldLabelStyle}>{t.retrievalMethod}</div>
                     <select value={retrievalMethod} onChange={e => onRetrieval(e.target.value)} style={inputStyle}>
                       {RETRIEVAL_METHODS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
                     </select>
@@ -1062,7 +1090,7 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
             </>
           ) : (
             <LocalAiFields
-              baseUrl={baseUrl} model={model} apiKey={apiKey} huntContradictions={huntContradictions}
+              baseUrl={baseUrl} model={model} apiKey={apiKey} huntContradictions={huntContradictions} t={t}
               onBaseUrl={onBaseUrl} onModel={onModel} onApiKey={onApiKey} onToggleHunt={onToggleHunt}
             />
           )}
@@ -1072,7 +1100,7 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
           width: '100%', marginTop: 28, background: C.teal, color: '#070C18', border: 'none',
           borderRadius: 9, padding: '14px', fontSize: 14.5, fontWeight: 700, cursor: 'pointer',
         }}>
-          Done
+          {t.done}
         </button>
       </div>
     </div>
@@ -1081,6 +1109,11 @@ function SettingsModal({ provider, baseUrl, model, apiKey, huntContradictions, p
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function Loupe() {
+  const [lang, setLang] = useState(() => localStorage.getItem('sv_lang') || 'en');
+  const t = stringsFor(lang);
+  const handleLang = v => { setLang(v); localStorage.setItem('sv_lang', v); };
+  const { STATUS, UNSUPPORTED_REASON_LABEL, UNCITED_CATEGORY_LABEL } = buildStatusMaps(t);
+
   const [provider, setProvider] = useState(() => localStorage.getItem('sv_provider') || 'browser');
   const [apiKey,   setApiKey]   = useState(() => localStorage.getItem('sv_api_key') || '');
   const [baseUrl,  setBaseUrl]  = useState(() => localStorage.getItem('sv_base_url') || PROVIDER_DEFAULTS.browser.baseUrl);
@@ -1160,13 +1193,13 @@ export default function Loupe() {
   const handlePaper = async file => {
     setUploadingPaper(true);
     try { const d = await readFile(file); setPaper(d); setPaperTxt(d.content || ''); }
-    catch (e) { setErr('Could not read paper: ' + e.message); }
+    catch (e) { setErr(t.couldNotReadPaper(e.message)); }
     finally { setUploadingPaper(false); }
   };
   const handleRefs = async files => {
     setUploadingRefs(true);
     try { const loaded = await Promise.all(files.map(readFile)); setRefs(prev => [...prev, ...loaded]); }
-    catch (e) { setErr('Could not read reference: ' + e.message); }
+    catch (e) { setErr(t.couldNotReadReference(e.message)); }
     finally { setUploadingRefs(false); }
   };
 
@@ -1196,20 +1229,20 @@ export default function Loupe() {
       setPaperTxt(snap.paperTxt || snap.paper?.content || '');
       setRefs(snap.refs || []);
       setErr(null);
-    } catch (e) { setErr('Could not read progress file: ' + e.message); }
+    } catch (e) { setErr(t.couldNotReadProgressFile(e.message)); }
   };
 
   // Shared by both a fresh run and a resume — resuming must not skip these.
   const validate = ({ forResume } = {}) => {
     if (providerInfo.kind !== 'browser') {
-      if (providerInfo.keyRequired && !apiKey.trim()) return `Enter your ${providerInfo.label} API key.`;
-      if (!baseUrl.trim()) return 'Enter the API base URL.';
-      if (!model.trim()) return 'Enter a model name.';
+      if (providerInfo.keyRequired && !apiKey.trim()) return t.enterApiKey(providerInfo.label);
+      if (!baseUrl.trim()) return t.enterBaseUrl;
+      if (!model.trim()) return t.enterModelName;
     }
     if (!forResume) {
       const text = paperTxt.trim() || paper?.content || paper?.text || '';
-      if (!text) return 'No paper text to verify.';
-      if (!refs.length) return 'Upload at least one reference source.';
+      if (!text) return t.noPaperText;
+      if (!refs.length) return t.uploadAtLeastOneSource;
     }
     return null;
   };
@@ -1244,8 +1277,8 @@ export default function Loupe() {
     // re-work, traded for not having to track partial-batch completion.
     while (i < chunks.length) {
       const batchEnd = Math.min(i + CHUNK_CONCURRENCY, chunks.length);
-      const batchLabel = batchEnd - i > 1 ? `chunks ${i + 1}–${batchEnd}` : `chunk ${i + 1}`;
-      setRunStatus(`Checking ${batchLabel} of ${chunks.length}…`);
+      const batchLabel = batchEnd - i > 1 ? t.chunksLabel(i + 1, batchEnd) : t.chunkLabel(i + 1);
+      setRunStatus(t.checkingBatch(batchLabel, chunks.length));
 
       let batchResults;
       try {
@@ -1253,7 +1286,7 @@ export default function Loupe() {
           Array.from({ length: batchEnd - i }, (_, k) => i + k).map(async idx => {
             const paperParts = [{ type: 'text', text: `[PAPER EXCERPT ${idx + 1}/${chunks.length}]\n${chunks[idx]}` }];
             const retryStatus = (attempt, max) =>
-              setRunStatus(`Checking ${batchLabel} of ${chunks.length} — a response wasn't usable, retrying (${attempt}/${max - 1})…`);
+              setRunStatus(t.checkingBatchRetrying(batchLabel, chunks.length, attempt, max - 1));
             const claimCall = callLLM({
               kind: providerInfo.kind, apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim(),
               parts: [...refParts, ...paperParts], instructions: claimInstructions({ whole: false }),
@@ -1275,7 +1308,7 @@ export default function Loupe() {
         saveProgress(snap);
         setLoading(false);
         setLiveChunk(null);
-        setErr(`Stopped around ${batchLabel} of ${chunks.length}: ${e.message}. Progress is saved — click Resume to continue, or download it below.`);
+        setErr(t.stoppedAround(batchLabel, chunks.length, e.message));
         return;
       }
 
@@ -1291,7 +1324,7 @@ export default function Loupe() {
       saveProgress({ chunks, chunkIndex: i, citedClaims: cited, uncitedClaims: uncited, contradictions, paper, paperTxt: text, refs });
     }
 
-    setResult(buildFinalResult(cited, uncited, contradictions, refs, text));
+    setResult(buildFinalResult(cited, uncited, contradictions, refs, text, lang, t));
     clearProgress();
     setLoading(false);
     setLiveChunk(null);
@@ -1301,11 +1334,11 @@ export default function Loupe() {
   const runWholeDocument = async () => {
     setLoading(true); setErr(null); setResult(null); setLiveClaims([]);
     setActiveFilter('ALL'); setUncitedReview({});
-    setRunStatus(huntContradictions ? 'Checking claims and hunting for contradictions…' : 'Reading sources and checking claims…');
+    setRunStatus(huntContradictions ? t.checkingAndHunting : t.defaultLoadingStatus);
     const refParts = buildRefParts(refs, providerInfo.kind);
     const paperParts = [filePart(paper, 'PAPER', providerInfo.kind), { type: 'text', text: '[The document above is the PAPER TO VERIFY]' }];
     const retryStatus = (attempt, max) =>
-      setRunStatus(`A response wasn't usable, retrying (${attempt}/${max - 1})…`);
+      setRunStatus(t.responseRetrying(attempt, max - 1));
     try {
       // The claim-check and contradiction-hunt calls are independent, so
       // they run concurrently instead of one after the other.
@@ -1327,8 +1360,8 @@ export default function Loupe() {
       // out of the separately pdfjs-extracted `paper.text`, which is used
       // below purely for reporting (entry count, source coverage), not
       // re-sent to the model.
-      setResult(buildFinalResult(verdict.citedClaims || [], verdict.uncitedClaims || [], cv.contradictions || [], refs, paper?.text || ''));
-    } catch (e) { setErr('Verification failed: ' + e.message); }
+      setResult(buildFinalResult(verdict.citedClaims || [], verdict.uncitedClaims || [], cv.contradictions || [], refs, paper?.text || '', lang, t));
+    } catch (e) { setErr(t.verificationFailed(e.message)); }
     finally { setLoading(false); setRunStatus(''); }
   };
 
@@ -1341,9 +1374,12 @@ export default function Loupe() {
     setActiveFilter('ALL'); setUncitedReview({});
     const worker = getWorker();
     const paperText = paper?.text || paperTxt.trim();
-    const allClaims = extractClaims(splitReferencesSection(paperText).body);
+    const allClaims = extractClaims(splitReferencesSection(paperText).body, lang);
     const citedCandidates = allClaims.filter(c => c.hasCitation);
-    const uncitedClaims = extractUncitedClaims(allClaims);
+    // extractUncitedClaims hardcodes its `note` in English (it's a pure
+    // text-processing function with no access to `t`) — swap in the
+    // translated version for display.
+    const uncitedClaims = extractUncitedClaims(allClaims, lang).map(c => ({ ...c, note: t.flaggedByLocalRules }));
 
     const onMessage = (resolveType, onMsg) => new Promise((resolve, reject) => {
       const handler = e => {
@@ -1356,14 +1392,14 @@ export default function Loupe() {
     });
 
     try {
-      setRunStatus('Loading local models (first run downloads them, then they\'re cached)…');
+      setRunStatus(t.loadingLocalModels);
       const modelsReady = onMessage('MODELS_READY', msg => {
         if (msg.type === 'MODEL_PROGRESS') setModelProgress(prev => ({ ...prev, [msg.model]: msg }));
       });
       const nliDtype = NLI_MODELS.find(m => m.id === nliModel)?.dtype;
       const embedCfg = EMBED_MODELS.find(m => m.id === embedModel) || {};
       worker.postMessage({
-        type: 'LOAD_MODELS', embedModel, nliModel, retrievalMethod, nliDtype,
+        type: 'LOAD_MODELS', embedModel, nliModel, retrievalMethod, nliDtype, lang,
         embedPooling: embedCfg.pooling || 'mean',
         embedQueryPrefix: embedCfg.queryPrefix || '',
         embedPassagePrefix: embedCfg.passagePrefix || '',
@@ -1371,28 +1407,29 @@ export default function Loupe() {
       await modelsReady;
       setModelProgress(null);
 
-      const refSentences = refs.flatMap(r => chunkReferenceIntoSentences(r.name, r.text || r.content || ''));
-      setRunStatus(`Indexing ${refSentences.length} sentences from ${refs.length} source${refs.length !== 1 ? 's' : ''}…`);
+      const refSentences = refs.flatMap(r => chunkReferenceIntoSentences(r.name, r.text || r.content || '', lang));
+      setRunStatus(t.indexingSentences(refSentences.length, refs.length));
       const indexed = onMessage('INDEXED', msg => {
-        if (msg.type === 'INDEX_PROGRESS') setRunStatus(`Indexing sentence ${msg.done} of ${msg.total}…`);
+        if (msg.type === 'INDEX_PROGRESS') setRunStatus(t.indexingProgress(msg.done, msg.total));
       });
       worker.postMessage({ type: 'INDEX', sentences: refSentences, retrievalMethod });
       await indexed;
 
-      setRunStatus(`Checking ${citedCandidates.length} cited claim${citedCandidates.length !== 1 ? 's' : ''}…`);
+      setRunStatus(t.checkingCitedClaims(citedCandidates.length));
       const citedClaims = [];
       const contradictions = [];
       let done = 0;
       const verified = onMessage('VERIFY_DONE', msg => {
         if (msg.type !== 'CLAIM_RESULT') return;
         done++;
-        setRunStatus(`Checking claim ${done} of ${citedCandidates.length}…`);
+        setRunStatus(t.checkingClaimProgress(done, citedCandidates.length));
         const claim = citedCandidates.find(c => c.index === msg.claimIndex);
         const r = msg.result;
         const explanation = r.nliScores
           ? `Cosine ${r.cosineSim.toFixed(2)}, NLI ${Math.round(Math.max(r.nliScores.supported, r.nliScores.contradicted) * 100)}%`
-          : 'No sufficiently similar passage found in sources.';
-        const entry = { claim: claim.text, citation: claim.citationText || '', status: r.status, evidence: r.evidence, source: r.source, confidence: r.confidence, explanation };
+          : t.noSimilarPassage;
+        const evidence = r.evidence === 'not found in sources' ? t.notFoundInSources : r.evidence;
+        const entry = { claim: claim.text, citation: claim.citationText || '', status: r.status, evidence, source: r.source, confidence: r.confidence, explanation };
         citedClaims.push(entry);
         setLiveClaims([...citedClaims]);
         if (r.status === 'CONTRADICTED') contradictions.push({ claim: claim.text, evidence: r.evidence, source: r.source, explanation });
@@ -1400,9 +1437,9 @@ export default function Loupe() {
       worker.postMessage({ type: 'VERIFY', claims: citedCandidates, retrievalMethod });
       await verified;
 
-      setResult(buildFinalResult(citedClaims, uncitedClaims, contradictions, refs, paperText));
+      setResult(buildFinalResult(citedClaims, uncitedClaims, contradictions, refs, paperText, lang, t));
     } catch (e) {
-      setErr('Verification failed: ' + e.message);
+      setErr(t.verificationFailed(e.message));
     } finally {
       setLoading(false); setRunStatus(''); setModelProgress(null);
     }
@@ -1441,7 +1478,7 @@ export default function Loupe() {
     // active would silently try an LLM-style request with an empty base
     // URL and fail confusingly far from the button that triggered it.
     if (providerInfo.kind === 'browser') {
-      setErr('This paused run is from an AI-provider verification, not the local browser pipeline — switch to the provider you were using (via the settings icon) and click Resume again.');
+      setErr(t.resumeWrongPipeline);
       return;
     }
     const problem = validate({ forResume: true });
@@ -1451,31 +1488,32 @@ export default function Loupe() {
 
   const buildReportText = () => {
     if (!result) return '';
+    const unsupportedLabel = { SOURCE_NOT_UPLOADED: t.unsupportedSourceNotUploaded, EXTRACTION_LIMITED: t.unsupportedExtractionLimited, NOT_FOUND_IN_SOURCE: t.unsupportedNotFoundInSource };
     const lines = [
-      `LOUPE — SOURCE VERIFICATION REPORT`,
-      `Raw score: ${result.rawScore}/100   Adjusted score: ${result.score}/100`,
-      `Source coverage: ${result.sourceCoverage.foundCount} of ${result.sourceCoverage.total} cited sources found in corpus`,
+      t.reportTitle,
+      t.reportScoreLine(result.rawScore, result.score),
+      t.reportCoverageLine(result.sourceCoverage.foundCount, result.sourceCoverage.total),
     ];
-    if (result.extractionWarnings.length) lines.push(`Sources with extraction warnings: ${result.extractionWarnings.join(', ')}`);
-    if (result.referencesInfo.found) lines.push(`References section: ${result.referencesInfo.entryCount} entries identified and excluded from verification.`);
+    if (result.extractionWarnings.length) lines.push(t.reportExtractionWarningsLine(result.extractionWarnings.join(', ')));
+    if (result.referencesInfo.found) lines.push(t.reportReferencesLine(result.referencesInfo.entryCount));
     lines.push('', result.summary, '');
 
     if (result.sourceCoverage.missing.length) {
-      lines.push(`SOURCE COVERAGE`);
-      lines.push(`The following cited sources were not found in the verification corpus: ${result.sourceCoverage.missing.map(m => m.raw).join('; ')}.`);
-      lines.push(`Upload these before re-running for a reliable score.`, '');
+      lines.push(t.reportSourceCoverageHeading);
+      lines.push(t.reportMissingSourcesLine(result.sourceCoverage.missing.map(m => m.raw).join('; ')));
+      lines.push(t.reportUploadBeforeRerun, '');
     }
 
     if (result.contradictions.length) {
-      lines.push(`CONTRADICTIONS`);
-      lines.push(...result.contradictions.map(c => `[CONTRADICTED] ${c.claim}\n  "${c.evidence}"\n  ${c.explanation}\n  Source: ${c.source}`));
+      lines.push(t.reportContradictionsHeading);
+      lines.push(...result.contradictions.map(c => `[CONTRADICTED] ${c.claim}\n  "${c.evidence}"\n  ${c.explanation}\n  ${t.reportSourceLine(c.source)}`));
       lines.push('');
     }
-    lines.push(`CITED CLAIMS`);
+    lines.push(t.reportCitedClaimsHeading);
     lines.push(...result.citedClaims.map(c =>
-      `[${c.status}${c.unsupportedReason ? ' · ' + UNSUPPORTED_REASON_LABEL[c.unsupportedReason] : ''}] ${c.claim}${c.citation ? ' ' + c.citation : ''}\n  Evidence: "${c.evidence}"\n  ${c.explanation}${c.source && c.source !== 'none' ? '\n  Source: ' + c.source : ''}`
+      `[${c.status}${c.unsupportedReason ? ' · ' + unsupportedLabel[c.unsupportedReason] : ''}] ${c.claim}${c.citation ? ' ' + c.citation : ''}\n  ${t.reportEvidenceLine(c.evidence)}\n  ${c.explanation}${c.source && c.source !== 'none' ? '\n  ' + t.reportSourceLine(c.source) : ''}`
     ));
-    lines.push('', `CLAIMS WITHOUT A CITATION`);
+    lines.push('', t.reportUncitedHeading);
     lines.push(...result.uncitedClaims.map(c => `- [${c.category}] ${c.claim}${c.note ? '\n  ' + c.note : ''}`));
     return lines.join('\n');
   };
@@ -1544,30 +1582,30 @@ export default function Loupe() {
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: '-0.02em' }}>Loupe</div>
           <div style={{ fontSize: 11.5, color: C.muted, marginTop: 2 }}>
-            Checks every citation, hunts for contradictions · no internet search
+            {t.tagline}
           </div>
         </div>
 
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
           {result && (
             <button onClick={startNewVerification} style={ghostBtnStyle}>
-              <ArrowLeft size={13} /> New verification
+              <ArrowLeft size={13} /> {t.newVerification}
             </button>
           )}
           {result && (
             <button onClick={copyReport} style={ghostBtnStyle}>
-              <Copy size={13} /> {copied ? 'Copied!' : 'Copy report'}
+              <Copy size={13} /> {copied ? t.copied : t.copyReport}
             </button>
           )}
           {result && (
             <button onClick={downloadReport} style={ghostBtnStyle}>
-              <Download size={13} /> Download report
+              <Download size={13} /> {t.downloadReport}
             </button>
           )}
-          <button onClick={() => setShowSettings(true)} title="Change what checks your claims — model, provider, or API key" style={ghostBtnStyle}>
+          <button onClick={() => setShowSettings(true)} title={t.settingsTooltip} style={ghostBtnStyle}>
             <Settings size={14} />
             <span>
-              <span style={{ color: C.muted, fontWeight: 400 }}>Checking with: </span>
+              <span style={{ color: C.muted, fontWeight: 400 }}>{t.checkingWith}</span>
               {provider === 'custom' && customProviderName ? customProviderName : providerInfo.label}
             </span>
           </button>
@@ -1576,10 +1614,10 @@ export default function Loupe() {
 
       {showSettings && (
         <SettingsModal
-          provider={provider} baseUrl={baseUrl} model={model} apiKey={apiKey}
+          provider={provider} baseUrl={baseUrl} model={model} apiKey={apiKey} t={t}
           huntContradictions={huntContradictions} providerInfo={providerInfo}
           embedModel={embedModel} nliModel={nliModel} retrievalMethod={retrievalMethod}
-          customProviderName={customProviderName}
+          customProviderName={customProviderName} lang={lang} LANGUAGES={LANGUAGES} onLang={handleLang}
           onProvider={handleProvider} onBaseUrl={handleBaseUrl} onModel={handleModel}
           onApiKey={handleApiKey} onToggleHunt={toggleHunt}
           onEmbedModel={handleEmbedModel} onNliModel={handleNliModel} onRetrieval={handleRetrieval}
@@ -1594,15 +1632,15 @@ export default function Loupe() {
         {!result && !loading && (
           <div className="setup">
             <div style={{ textAlign: 'center' }}>
-              <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: '-0.02em', margin: 0 }}>Verify your paper's claims</h1>
+              <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: '-0.02em', margin: 0 }}>{t.setupTitle}</h1>
               <p style={{ fontSize: 13, color: C.muted, marginTop: 8, lineHeight: 1.55, maxWidth: 480, marginLeft: 'auto', marginRight: 'auto' }}>
-                Checks every citation against your sources and flags anything stated without one.
+                {t.setupSubtitle}
               </p>
               <div style={{
                 display: 'inline-flex', alignItems: 'center', gap: 7, marginTop: 16, fontSize: 11.5, color: C.muted,
                 background: C.tealBg, border: `1px solid ${C.teal}22`, borderRadius: 20, padding: '7px 15px',
               }}>
-                <ShieldCheck size={13} color={C.teal} /> Runs entirely in your browser — nothing is stored on any server
+                <ShieldCheck size={13} color={C.teal} /> {t.runsInBrowserBadge}
               </div>
             </div>
 
@@ -1610,12 +1648,12 @@ export default function Loupe() {
               <div style={{ background: C.amberBg, border: `1px solid ${C.amber}44`, borderRadius: 10, padding: '16px 20px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
                 <AlertTriangle size={16} color="#FBBF24" style={{ flexShrink: 0 }} />
                 <div style={{ fontSize: 13, color: '#FBBF24', flex: 1, minWidth: 200 }}>
-                  Paused at chunk {progress.chunkIndex} of {progress.chunks.length} from a previous run
+                  {t.pausedAt(progress.chunkIndex, progress.chunks.length)}
                 </div>
                 <div style={{ display: 'flex', gap: 10 }}>
-                  <button onClick={resume} style={smallBtnStyle(C.amber)}>Resume</button>
+                  <button onClick={resume} style={smallBtnStyle(C.amber)}>{t.resume}</button>
                   <button onClick={downloadProgress} style={{ ...smallBtnStyle(C.border), display: 'flex', alignItems: 'center', gap: 5 }}>
-                    <Download size={12} /> Download
+                    <Download size={12} /> {t.download}
                   </button>
                 </div>
               </div>
@@ -1624,10 +1662,10 @@ export default function Loupe() {
             <div className="setup-grid">
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <div style={labelStyle}>Paper to verify <span style={{ color: C.red, fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>required</span></div>
+                  <div style={labelStyle}>{t.paperToVerify} <span style={{ color: C.red, fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>{t.required}</span></div>
                   {!paper && !paperTxt.trim() && (lastPaper || lastPaperTxt.trim()) && (
                     <button onClick={restorePaper} style={{ background: 'none', border: 'none', color: C.teal, cursor: 'pointer', fontSize: 11.5, marginBottom: 12 }}>
-                      Restore previous paper
+                      {t.restorePreviousPaper}
                     </button>
                   )}
                 </div>
@@ -1639,8 +1677,8 @@ export default function Loupe() {
                         <div style={{ fontSize: 13.5, fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{paper.name}</div>
                         <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
                           {paper.type === 'pdf'
-                            ? (singlePassPdf ? 'PDF document · single-pass (native, no chunking)' : 'PDF document · read as extracted text')
-                            : `${(paper.content || '').split(' ').filter(Boolean).length} words`}
+                            ? (singlePassPdf ? t.pdfSinglePass : t.pdfExtractedText)
+                            : t.wordCount((paper.content || '').split(' ').filter(Boolean).length)}
                         </div>
                       </div>
                       <button onClick={() => { setPaper(null); setPaperTxt(''); }} style={{ background: 'none', border: 'none', color: C.red, cursor: 'pointer' }}>
@@ -1649,7 +1687,7 @@ export default function Loupe() {
                     </div>
                   ) : (pasteMode || paperTxt.trim()) ? (
                     <>
-                      <textarea value={paperTxt} onChange={e => setPaperTxt(e.target.value)} placeholder="Paste the paper text here…" autoFocus
+                      <textarea value={paperTxt} onChange={e => setPaperTxt(e.target.value)} placeholder={t.pasteTextPlaceholder} autoFocus
                                 style={{
                                   width: '100%', minHeight: paperTxt.trim() ? 340 : 160, background: 'transparent', border: 'none', outline: 'none',
                                   padding: '16px 20px', color: C.text, fontSize: 13, lineHeight: 1.65, resize: 'vertical', fontFamily: 'inherit',
@@ -1658,21 +1696,21 @@ export default function Loupe() {
                       <div style={{ borderTop: `1px solid ${C.border}`, padding: '10px 20px' }}>
                         {paperTxt.trim() ? (
                           <button onClick={() => setPaperTxt('')} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 12 }}>
-                            Clear text
+                            {t.clearText}
                           </button>
                         ) : (
                           <button onClick={() => setPasteMode(false)} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 12 }}>
-                            ← Back to file upload
+                            {t.backToFileUpload}
                           </button>
                         )}
                       </div>
                     </>
                   ) : (
                     <>
-                      <DropZone label="Upload paper" sub=".txt · .docx · .pdf" onFile={handlePaper} busy={uploadingPaper} flush />
+                      <DropZone label={t.uploadPaper} sub={t.fileTypesHint} onFile={handlePaper} busy={uploadingPaper} flush t={t} />
                       <div style={{ borderTop: `1px solid ${C.border}`, padding: '10px 20px', textAlign: 'center' }}>
                         <button onClick={() => setPasteMode(true)} style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 7, color: C.muted, cursor: 'pointer', fontSize: 12, padding: '7px 16px' }}>
-                          Or paste text instead
+                          {t.orPasteTextInstead}
                         </button>
                       </div>
                     </>
@@ -1680,22 +1718,22 @@ export default function Loupe() {
                 </div>
                 {isChunkable && (
                   <div style={{ fontSize: 11.5, color: C.muted, marginTop: 8 }}>
-                    ~{estChunks} chunk{estChunks !== 1 ? 's' : ''} · ~{estCalls} API call{estCalls !== 1 ? 's' : ''} to check every cited claim
+                    {t.chunkEstimate(estChunks, estCalls)}
                   </div>
                 )}
                 {providerInfo.kind === 'browser' && browserClaimEstimate > 0 && (
                   <div style={{ fontSize: 11.5, color: C.muted, marginTop: 8 }}>
-                    ~{browserClaimEstimate} cited claim{browserClaimEstimate !== 1 ? 's' : ''} detected — no API calls, runs entirely on-device
+                    {t.browserClaimEstimate(browserClaimEstimate)}
                   </div>
                 )}
               </div>
 
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <div style={labelStyle}>Reference sources</div>
+                  <div style={labelStyle}>{t.referenceSources}</div>
                   {refs.length === 0 && lastRefs.length > 0 && (
                     <button onClick={restoreRefs} style={{ background: 'none', border: 'none', color: C.teal, cursor: 'pointer', fontSize: 11.5, marginBottom: 12 }}>
-                      Restore previous sources
+                      {t.restorePreviousSources}
                     </button>
                   )}
                 </div>
@@ -1711,15 +1749,15 @@ export default function Loupe() {
                       ))}
                     </div>
                   ) : (
-                    <DropZone label="Upload sources (multiple)" sub=".txt · .docx · .pdf" multi onFiles={handleRefs} busy={uploadingRefs} flush />
+                    <DropZone label={t.uploadSources} sub={t.fileTypesHint} multi onFiles={handleRefs} busy={uploadingRefs} flush t={t} />
                   )}
                   <div style={{ borderTop: refs.length ? `1px solid ${C.border}` : 'none', marginTop: refs.length ? 10 : 0 }}>
                     {refs.length > 0 ? (
-                      <DropZone label="Add more sources" multi onFiles={handleRefs} busy={uploadingRefs} flush compact />
+                      <DropZone label={t.addMoreSources} multi onFiles={handleRefs} busy={uploadingRefs} flush compact t={t} />
                     ) : (
                       <div style={{ borderTop: `1px solid ${C.border}`, padding: '10px 20px', textAlign: 'center' }}>
                         <span style={{ display: 'inline-block', border: `1px solid transparent`, borderRadius: 7, color: C.muted, cursor: 'default', fontSize: 12, padding: '7px 16px' }}>
-                          Add as many as you need
+                          {t.addAsManyAsNeeded}
                         </span>
                       </div>
                     )}
@@ -1727,7 +1765,7 @@ export default function Loupe() {
                 </div>
                 {refs.length === 0 && (
                   <div style={{ fontSize: 12.5, color: C.muted, marginTop: 14, lineHeight: 1.6 }}>
-                    The documents you want claims cross-checked against — papers, reports, datasets, anything with the facts your paper cites.
+                    {t.refsHelperText}
                   </div>
                 )}
               </div>
@@ -1740,7 +1778,7 @@ export default function Loupe() {
                 fontSize: 15, fontWeight: 700, cursor: canRun ? 'pointer' : 'not-allowed',
                 display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 10, transition: 'all .15s',
               }}>
-                <BookOpen size={17} /> Verify Claims
+                <BookOpen size={17} /> {t.verifyClaims}
               </button>
               {err && (
                 <div style={{ background: '#1A0D0D', border: `1px solid #5D1A1A`, borderRadius: 9, padding: '13px 18px', fontSize: 13, color: '#FCA5A5', lineHeight: 1.6, marginTop: 18, maxWidth: 560, marginLeft: 'auto', marginRight: 'auto' }}>
@@ -1753,15 +1791,14 @@ export default function Loupe() {
                     background: 'none', border: 'none', color: C.muted, cursor: 'pointer',
                     fontSize: 12, textDecoration: 'underline', textUnderlineOffset: 3,
                   }}>
-                    Resuming on a different machine? Load a progress file
+                    {t.resumeOnDifferentMachine}
                   </button>
                 </div>
               )}
             </div>
 
             <p style={{ fontSize: 12.5, color: C.muted, lineHeight: 1.7, textAlign: 'center', maxWidth: 620, margin: '0 auto' }}>
-              Text/docx papers are split into chunks so every cited claim gets checked, not just the top few — PDF papers run in a single pass.
-              A dedicated pass hunts for contradictions. If a run is interrupted, progress saves automatically so you can resume it.
+              {t.setupFooterNote}
             </p>
           </div>
         )}
@@ -1769,24 +1806,24 @@ export default function Loupe() {
         {loading && (
           <div style={{ minHeight: '50vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 20 }}>
             <div style={{ width: 52, height: 52, borderRadius: '50%', border: `3px solid ${C.border}`, borderTop: `3px solid ${C.teal}`, animation: 'spin 1s linear infinite' }} />
-            <div style={{ fontSize: 14.5, color: C.muted }}>{runStatus || 'Reading sources and checking claims…'}</div>
+            <div style={{ fontSize: 14.5, color: C.muted }}>{runStatus || t.defaultLoadingStatus}</div>
             {liveChunk && <div style={{ width: 280 }}><ProgressBar current={liveChunk.current} total={liveChunk.total} /></div>}
             {modelProgress && Object.keys(modelProgress).length > 0 && (
               <div style={{ width: 280, display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ fontSize: 11.5, color: C.muted, textAlign: 'center' }}>
-                  One-time download — needs internet now, then this runs offline every time after.
+                  {t.oneTimeDownloadNote}
                 </div>
                 {Object.entries(modelProgress).map(([key, p]) => (
                   <div key={key}>
                     <div style={{ fontSize: 11.5, color: C.muted, marginBottom: 4 }}>
-                      {key === 'embedding' ? 'Embedding model' : 'NLI model'} — {typeof p.progress === 'number' ? `${Math.round(p.progress)}%` : (p.status || 'loading')}
+                      {key === 'embedding' ? t.embeddingModelLabel : key === 'translation' ? t.translationModelLabel : t.nliModelLabel} — {typeof p.progress === 'number' ? `${Math.round(p.progress)}%` : (p.status || 'loading')}
                     </div>
                     <ProgressBar current={typeof p.progress === 'number' ? p.progress : 0} total={100} />
                   </div>
                 ))}
               </div>
             )}
-            <LiveProgressPanel liveClaims={liveClaims} />
+            <LiveProgressPanel liveClaims={liveClaims} t={t} />
           </div>
         )}
 
@@ -1796,67 +1833,70 @@ export default function Loupe() {
               <ScoreSeal score={result.score} />
               <div style={{ flex: 1, minWidth: 240 }}>
                 <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <span>Citation Accuracy Score (adjusted)</span>
-                  <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: C.muted }}>Raw score: {result.rawScore}/100</span>
+                  <span>{t.citationAccuracyScore}</span>
+                  <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: C.muted }}>{t.rawScoreLabel(result.rawScore)}</span>
                 </div>
                 <div style={{ fontSize: 15, color: C.text, lineHeight: 1.75 }}>{result.summary}</div>
                 <div style={{ display: 'flex', gap: 20, marginTop: 18, flexWrap: 'wrap' }}>
-                  {['SUPPORTED', 'PARTIAL', 'UNSUPPORTED', 'CONTRADICTED'].map(s => {
+                  {[
+                    ['SUPPORTED', t.countSupported], ['PARTIAL', t.countPartial],
+                    ['UNSUPPORTED', t.countUnsupported], ['CONTRADICTED', t.countContradicted],
+                  ].map(([s, countLabel]) => {
                     const st = STATUS[s], count = result.counts[s];
                     if (!count) return null;
                     return (
                       <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <div style={{ width: 8, height: 8, borderRadius: '50%', background: st.col }} />
-                        <span style={{ fontSize: 12, color: C.muted }}>{count} {st.label.toLowerCase()}</span>
+                        <span style={{ fontSize: 12, color: C.muted }}>{countLabel(count)}</span>
                       </div>
                     );
                   })}
                   {result.uncitedClaims.length > 0 && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                       <div style={{ width: 8, height: 8, borderRadius: '50%', background: C.faint }} />
-                      <span style={{ fontSize: 12, color: C.muted }}>{result.uncitedClaims.length} uncited</span>
+                      <span style={{ fontSize: 12, color: C.muted }}>{t.countUncited(result.uncitedClaims.length)}</span>
                     </div>
                   )}
                 </div>
               </div>
             </div>
 
-            <SourceCoveragePanel coverage={result.sourceCoverage} extractionWarnings={result.extractionWarnings} referencesInfo={result.referencesInfo} />
+            <SourceCoveragePanel coverage={result.sourceCoverage} extractionWarnings={result.extractionWarnings} referencesInfo={result.referencesInfo} t={t} />
 
             {result.contradictions.length > 0 && (
               <>
                 <div style={{ fontSize: 12, fontWeight: 700, color: C.red2, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 7 }}>
-                  <AlertTriangle size={14} /> Contradictions Found
+                  <AlertTriangle size={14} /> {t.contradictionsFound}
                 </div>
                 {result.contradictions.map((c, i) => <ContradictionCard key={i} item={c} />)}
               </>
             )}
 
-            <FilterTabs result={result} active={activeFilter} onChange={setActiveFilter} />
+            <FilterTabs result={result} active={activeFilter} onChange={setActiveFilter} t={t} STATUS={STATUS} />
 
             {activeFilter !== 'UNCITED' && (
               <>
                 <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: result.contradictions.length ? 36 : 0, marginBottom: 16 }}>
-                  Cited Claims — Checked Against Sources
+                  {t.citedClaimsHeading}
                 </div>
                 {result.citedClaims
                   .filter(c => activeFilter === 'ALL' || c.status === activeFilter)
-                  .map((c, i) => <ClaimCard key={i} claim={c} />)}
+                  .map((c, i) => <ClaimCard key={i} claim={c} STATUS={STATUS} UNSUPPORTED_REASON_LABEL={UNSUPPORTED_REASON_LABEL} />)}
               </>
             )}
 
             {result.uncitedClaims.length > 0 && (activeFilter === 'ALL' || activeFilter === 'UNCITED') && (
               <>
                 <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: 36, marginBottom: 10 }}>
-                  Claims With No Citation
+                  {t.uncitedClaimsHeading}
                 </div>
                 <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, marginBottom: 16 }}>
-                  Not checked against your sources — review these yourself to confirm they're your own analysis.
+                  {t.uncitedClaimsSubtitle}
                 </div>
                 {result.uncitedClaims.length <= 10 ? (
                   result.uncitedClaims.map((c, i) => (
                     <UncitedClaimCard
-                      key={i} claim={c} suggestion={uncitedSuggestions[i]}
+                      key={i} claim={c} suggestion={uncitedSuggestions[i]} t={t}
                       review={uncitedReview[i]}
                       onMine={() => setUncitedReview(prev => ({ ...prev, [i]: 'own' }))}
                       onHelp={() => setUncitedReview(prev => ({ ...prev, [i]: 'shown' }))}
@@ -1870,7 +1910,7 @@ export default function Loupe() {
                     if (!claims.length) return null;
                     return (
                       <UncitedGroup
-                        key={category} category={category} claims={claims}
+                        key={category} category={category} claims={claims} t={t} UNCITED_CATEGORY_LABEL={UNCITED_CATEGORY_LABEL}
                         suggestions={uncitedSuggestions} review={uncitedReview}
                         onMine={i => setUncitedReview(prev => ({ ...prev, [i]: 'own' }))}
                         onHelp={i => setUncitedReview(prev => ({ ...prev, [i]: 'shown' }))}
@@ -1882,7 +1922,7 @@ export default function Loupe() {
             )}
 
             <div style={{ marginTop: 36, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: '20px 24px' }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 14 }}>Sources checked</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 14 }}>{t.sourcesChecked}</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                 {refs.map((r, i) => <FileChip key={i} name={r.name} />)}
               </div>
@@ -1891,7 +1931,7 @@ export default function Loupe() {
         )}
       </div>
 
-      <Footer />
+      <Footer t={t} />
 
       <input ref={progressUpload} type="file" accept=".json" style={{ display: 'none' }}
              onChange={e => { if (e.target.files[0]) uploadProgress(e.target.files[0]); e.target.value = ''; }} />

@@ -9,11 +9,18 @@ import { splitReferenceEntries, findAllCitations } from './textProcessing.js';
 // metadata of its own. Both callers below share this so a reference-list
 // entry and its in-text citation resolve to the same key.
 // Strips the lead-in phrase from textProcessing.js's SIGNAL_BARE_CITATION
-// style ("According to Smith, 2020" / "Per Smith, 2020") before hunting for
-// the surname — without this, "According"/"Per" (both capitalized, both
-// ahead of the year) get picked up as the name instead of the actual author,
-// which silently breaks matching for that citation style specifically.
-const LEAD_IN = /^\(?\s*(according\s+to|per)\s+/i;
+// style ("According to Smith, 2020" / "Per Smith, 2020" / Indonesian
+// "Menurut Smith, 2020" / "Berdasarkan Smith, 2020") before hunting for the
+// surname — without this, the lead-in word itself (capitalized, ahead of
+// the year, just like "According"/"Per") gets picked up as the name instead
+// of the actual author, which silently breaks matching for that citation
+// style specifically. Caught live in this exact form — an end-to-end
+// Indonesian run showed "1 of 1" sources found when it should have been
+// "1 of 2", traced back to "Menurut Martinez, 2019" resolving to key
+// "menurut-2019" instead of "martinez-2019" — the same bug the
+// "According"/"Per" fix addressed for English, just missing its Indonesian
+// counterpart when SIGNAL_BARE_CITATION was widened.
+const LEAD_IN = /^\(?\s*(according\s+to|per|menurut|berdasarkan)\s+/i;
 
 export function extractCitationKey(text) {
   const stripped = text.replace(LEAD_IN, '');
