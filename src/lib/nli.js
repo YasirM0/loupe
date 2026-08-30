@@ -51,10 +51,19 @@ export function verdictFromScores(agg, topCosine) {
   return { status, confidence };
 }
 
-const PERCENT_PATTERN = /\b(\d+(?:\.\d+)?)%/g;
+// "persen" (Indonesian for "percent", spelled out rather than "%" — the
+// natural way an Indonesian source document writes it, confirmed live: an
+// end-to-end run against a source reading "...89 persen..." left this guard
+// unable to see the number at all, since the pattern only recognized a
+// literal "%" glyph, and a genuine numeric-mismatch case (claim: 95%) sailed
+// through as PARTIAL instead of being caught) is matched alongside "%"
+// unconditionally — the word doesn't collide with English text, so this is
+// a strict widening, same reasoning as the other language-additive patterns
+// in textProcessing.js.
+const PERCENT_PATTERN = /\b(\d+(?:[.,]\d+)?)\s*(?:%|persen\b)/gi;
 
 function extractPercents(text) {
-  return [...text.matchAll(PERCENT_PATTERN)].map(m => parseFloat(m[1]));
+  return [...text.matchAll(PERCENT_PATTERN)].map(m => parseFloat(m[1].replace(',', '.')));
 }
 
 // NLI models judge topic/vocabulary alignment far more reliably than the
