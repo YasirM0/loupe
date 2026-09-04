@@ -1,3 +1,5 @@
+![Loupe Graphical Abstract](loupe-graphical-abstract.svg)
+
 # Loupe — AI Research Paper Citation & Reference Verifier
 
 **Loupe** is a free, open-source tool that checks whether a research paper's citations actually say what the paper claims they say. Upload a paper and its reference sources, and Loupe cross-references every cited claim against them, flags claims made with no citation at all, and runs a dedicated pass to hunt for outright contradictions between the paper and its own sources — entirely in your browser, using your own AI provider API key.
